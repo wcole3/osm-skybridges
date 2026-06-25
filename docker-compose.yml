@@ -1,0 +1,37 @@
+services:
+  db:
+    image: postgis/postgis:16-3.5
+    container_name: osm_skybridge_db
+    environment:
+      POSTGRES_DB: osm
+      POSTGRES_USER: osm
+      POSTGRES_PASSWORD: osm
+    ports:
+      - "5439:5432"        # host 5439 -> avoid clashing with a local Postgres
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U osm -d osm"]
+      interval: 4s
+      timeout: 5s
+      retries: 30
+
+  tools:                    # osmium-tool + osm2pgsql, run on demand
+    build: ./tools
+    container_name: osm_skybridge_tools
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      PGHOST: db
+      PGPORT: "5432"
+      PGDATABASE: osm
+      PGUSER: osm
+      PGPASSWORD: osm
+    volumes:
+      - ./:/work
+    working_dir: /work
+    # no long-running command; invoked via `docker compose run --rm tools ...`
+
+volumes:
+  pgdata:

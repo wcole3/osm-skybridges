@@ -1,0 +1,12 @@
+# OSM extracts and generated tiles/exports
+/data/
+/web/data/
+/qa/*.geojson
+
+# local region selection (copy from region.example.mk)
+/region.mk
+
+# editor / os
+.DS_Store
+*.swp
+.vscode/dostuff/

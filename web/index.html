@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>OSM Skybridge Viewer — Washington DC</title>
+<link href="https://unpkg.com/maplibre-gl@4/dist/maplibre-gl.css" rel="stylesheet" />
+<script src="https://unpkg.com/maplibre-gl@4/dist/maplibre-gl.js"></script>
+<script src="https://unpkg.com/deck.gl@9/dist.min.js"></script>
+<style>
+  html, body, #map { margin: 0; height: 100%; width: 100%; }
+  body { font: 13px/1.4 system-ui, sans-serif; }
+  #panel {
+    position: absolute; top: 12px; left: 12px; z-index: 2;
+    background: rgba(255,255,255,.94); padding: 12px 14px; border-radius: 8px;
+    box-shadow: 0 2px 10px rgba(0,0,0,.25); max-width: 320px;
+  }
+  #panel h1 { font-size: 14px; margin: 0 0 6px; }
+  #panel label { display: block; margin: 6px 0; cursor: pointer; }
+  .legend i { display:inline-block; width:12px; height:12px; border-radius:2px; margin-right:6px; vertical-align:-1px; }
+  #status { color:#666; margin-top:8px; font-size:12px; }
+  #tip {
+    position:absolute; z-index:3; pointer-events:none; display:none;
+    background:#111; color:#fff; padding:6px 8px; border-radius:4px; font-size:12px; max-width:260px;
+  }
+  button { font: inherit; padding: 4px 8px; border-radius:6px; border:1px solid #bbb; background:#fff; cursor:pointer; }
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div id="tip"></div>
+<div id="panel">
+  <h1>OSM Skybridge Viewer — DC</h1>
+  <div class="legend">
+    <div><i style="background:rgb(150,160,180)"></i> building / part</div>
+    <div><i style="background:rgb(120,180,255)"></i> detected skybridge / passage</div>
+    <div><i style="background:rgb(235,90,90)"></i> removed from footprint</div>
+  </div>
+  <label title="Choose what to render">view:
+    <select id="viewMode">
+      <option value="raw">Raw OSM (the bug)</option>
+      <option value="corrected" selected>Corrected float (lifted)</option>
+      <option value="footprint">Modified footprint (cut)</option>
+    </select>
+  </label>
+  <label title="Highlight buildings that lack a float base">
+    <input type="checkbox" id="toggleMissing" /> highlight buildings missing a base
+  </label>
+  <button id="flyFocus">↪ fly to focus</button>
+  <div id="status">loading…</div>
+</div>
+
+<script>
+const {MapboxOverlay, GeoJsonLayer, SolidPolygonLayer} = deck;
+
+// Camera focus — defaults to DC's convention center; overridden by data/meta.json
+// (written per-region by `make export`), so the viewer follows the loaded region.
+let FOCUS = {center: [-77.0230, 38.9051], zoom: 15.3, pitch: 55, bearing: -20, label: 'convention center'};
+
+const map = new maplibregl.Map({
+  container: 'map',
+  style: 'https://basemaps.cartocdn.com/gl/positron-gl-style/style.json',
+  center: FOCUS.center, zoom: FOCUS.zoom, pitch: FOCUS.pitch, bearing: FOCUS.bearing,
+  antialias: true
+});
+const overlay = new MapboxOverlay({interleaved: true, layers: []});
+map.addControl(overlay);
+map.addControl(new maplibregl.NavigationControl({visualizePitch: true}), 'top-right');
+
+// mode: 'raw' | 'corrected' | 'footprint'
+const state = {buildings: null, buildingsCorrected: null, skybridges: null, spanItems: [], cuts: null, mode: 'corrected', showMissing: false};
+const tip = document.getElementById('tip');
+const status = document.getElementById('status');
+
+async function loadJSON(url) {
+  try { const r = await fetch(url); if (!r.ok) return null; return await r.json(); }
+  catch (e) { return null; }
+}
+
+// SolidPolygonLayer renders ONE polygon (with optional holes) per data item and
+// does NOT accept MultiPolygon. So we explode every span feature into one item
+// per constituent polygon. Each item carries its rings + the span's properties.
+function explodeSpans(fc) {
+  const items = [];
+  for (const f of (fc && fc.features) || []) {
+    const g = f.geometry;
+    const polys = g.type === 'MultiPolygon' ? g.coordinates : [g.coordinates];
+    for (const rings of polys) items.push({rings, properties: f.properties});
+  }
+  return items;
+}
+
+// Lift mechanism for deck.gl: there is NO fill-extrusion-base. We inject the
+// float base into the polygon's Z coordinates; SolidPolygonLayer then adds
+// getElevation (the thickness) on top of that vertex base altitude — so the
+// deck floats. Returns an array of rings (outer + holes) with Z = baseZ.
+function liftRings(rings, baseZ) {
+  return rings.map(ring => ring.map(([x, y]) => [x, y, baseZ]));
+}
+
+function buildLayers() {
+  const layers = [];
+  const modified = state.mode !== 'raw';   // corrected & footprint use the cut footprints
+
+  // Buildings: raw (the solid-wall bug) vs modified (span regions cut out).
+  const bdata = modified && state.buildingsCorrected ? state.buildingsCorrected : state.buildings;
+  if (bdata) {
+    layers.push(new GeoJsonLayer({
+      id: 'buildings',
+      data: bdata,
+      extruded: true,
+      getElevation: f => f.properties.top_h || 8,
+      getFillColor: f => state.showMissing && f.properties.missing_base
+        ? [230, 150, 90] : [150, 160, 180],
+      getLineColor: [60, 60, 70, 0],
+      material: {ambient: 0.45, diffuse: 0.6, shininess: 16},
+      pickable: true,
+      autoHighlight: true,
+      highlightColor: [255, 255, 160, 120],
+      updateTriggers: {getFillColor: [state.showMissing]}
+    }));
+  }
+
+  // 'footprint' mode: show the REMOVED region as a flat red patch on the ground,
+  // so the modified footprint (building minus this) is explicit.
+  if (state.mode === 'footprint' && state.cuts) {
+    layers.push(new GeoJsonLayer({
+      id: 'cuts',
+      data: state.cuts,
+      extruded: false,
+      stroked: true, filled: true,
+      getFillColor: [235, 90, 90, 150],
+      getLineColor: [200, 40, 40, 255], getLineWidth: 1.5, lineWidthUnits: 'pixels', lineWidthMinPixels: 1.5,
+      parameters: {depthTest: false},
+      pickable: false
+    }));
+  }
+
+  // 'corrected' mode: detected spans lifted to their float base (Z-lifted single
+  // polygons; SolidPolygonLayer can't take MultiPolygon so spans were exploded).
+  if (state.mode === 'corrected' && state.spanItems.length) {
+    layers.push(new SolidPolygonLayer({
+      id: 'skybridges',
+      data: state.spanItems,
+      extruded: true,
+      getPolygon: d => liftRings(d.rings, d.properties.base_h || 0),
+      getElevation: d => Math.max(1, (d.properties.top_h || 0) - (d.properties.base_h || 0)),
+      getFillColor: d => d.properties.class === 'footbridge' ? [255, 170, 90, 235] : [90, 150, 255, 235],
+      material: {ambient: 0.5, diffuse: 0.7, shininess: 24},
+      pickable: true
+    }));
+  }
+  overlay.setProps({layers});
+}
+
+function showTip(info) {
+  if (!info || !info.object) { tip.style.display = 'none'; return; }
+  const p = info.object.properties || {};
+  tip.style.display = 'block';
+  tip.style.left = info.x + 12 + 'px';
+  tip.style.top = info.y + 12 + 'px';
+  tip.innerHTML = `<b>${p.name || p.kind || 'feature'}</b><br>osm_id ${p.osm_id || '?'}<br>`
+    + `base ${p.base_h ?? 0} m → top ${p.top_h ?? '?'} m`
+    + (p.reason ? `<br>reason: ${p.reason}` : '')
+    + (p.confidence ? `<br>confidence: ${p.confidence}` : '')
+    + (p.missing_base ? '<br><i>missing float base</i>' : '');
+}
+overlay.setProps({onHover: showTip});
+
+document.getElementById('viewMode').onchange = e => { state.mode = e.target.value; buildLayers(); };
+document.getElementById('toggleMissing').onchange = e => { state.showMissing = e.target.checked; buildLayers(); };
+document.getElementById('flyFocus').onclick = () =>
+  map.flyTo({center: FOCUS.center, zoom: FOCUS.zoom, pitch: FOCUS.pitch, bearing: FOCUS.bearing});
+
+map.on('load', async () => {
+  // per-region camera + labels
+  const meta = await loadJSON('data/meta.json');
+  if (meta && meta.center) {
+    FOCUS = Object.assign(FOCUS, meta);
+    map.jumpTo({center: FOCUS.center, zoom: FOCUS.zoom, pitch: FOCUS.pitch, bearing: FOCUS.bearing});
+    document.getElementById('flyFocus').textContent = '↪ fly to ' + (FOCUS.label || 'focus');
+    document.querySelector('#panel h1').textContent = 'OSM Skybridge Viewer — ' + (FOCUS.label || '');
+  }
+  state.buildings = await loadJSON('data/buildings.geojson');
+  state.buildingsCorrected = await loadJSON('data/buildings_corrected.geojson'); // Phase 2+
+  state.skybridges = await loadJSON('data/skybridges.geojson');   // may not exist yet (Phase 0)
+  state.cuts = await loadJSON('data/cuts.geojson');               // Phase 2+ (modified footprint)
+  state.spanItems = explodeSpans(state.skybridges);
+  const nb = state.buildings ? state.buildings.features.length : 0;
+  const ns = state.spanItems.length;
+  status.textContent = `${nb.toLocaleString()} buildings · ${ns} detected spans`
+    + (ns ? '' : ' (run `make sql && make export` to detect spans)');
+  buildLayers();
+});
+</script>
+</body>
+</html>
