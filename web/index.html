@@ -46,6 +46,9 @@
   <label title="Highlight buildings that lack a float base">
     <input type="checkbox" id="toggleMissing" /> highlight buildings missing a base
   </label>
+  <label title="Show only the buildings a correction touches, plus the current view's correction overlay — declutter to just what changed">
+    <input type="checkbox" id="toggleFocus" /> focus: only what changed
+  </label>
   <button id="flyFocus">↪ fly to focus</button>
   <div id="status">loading…</div>
 </div>
@@ -68,7 +71,7 @@ map.addControl(overlay);
 map.addControl(new maplibregl.NavigationControl({visualizePitch: true}), 'top-right');
 
 // mode: 'raw' | 'corrected' | 'footprint'
-const state = {buildings: null, buildingsCorrected: null, skybridges: null, spanItems: [], cuts: null, mode: 'corrected', showMissing: false};
+const state = {buildings: null, buildingsCorrected: null, skybridges: null, spanItems: [], cuts: null, mode: 'corrected', showMissing: false, focusChanges: false, hostIds: new Set(), correctedIds: new Set(), baseStatus: ''};
 const tip = document.getElementById('tip');
 const status = document.getElementById('status');
 
@@ -98,12 +101,55 @@ function liftRings(rings, baseZ) {
   return rings.map(ring => ring.map(([x, y]) => [x, y, baseZ]));
 }
 
+// Focus mode: thin the building layer to only the buildings a correction
+// involves. The span/cut overlays (separate layers) are untouched, so in
+// 'corrected' the lifted spans and in 'footprint' the cut patches stay visible.
+//   corrected/footprint (correctedSrc): the modified dataset carries a `carved`
+//     flag — keep carved hosts. bridge_struct/geom polygons are already gone
+//     from this dataset (shown as floating spans), so nothing involved is lost.
+//   raw: no `carved` flag, so match the same hosts by osm_id (state.hostIds),
+//     PLUS the polygons lifted into spans — present in raw but absent from the
+//     corrected dataset — so the structures a correction acts on stay on screen.
+// osm_id is assumed unique within the export radius (osm_type isn't exported);
+// that holds for the shipped regions. Memoised on (mode, source) so a
+// recolor-only rebuild reuses the same data reference and deck.gl can skip
+// re-tessellating the filtered set.
+let _focusCache = {key: null, src: null, fc: null};
+function focusFilter(fc, correctedSrc) {
+  if (!state.focusChanges || !fc) return fc;
+  const key = state.mode + (correctedSrc ? ':c' : ':r');
+  if (_focusCache.key === key && _focusCache.src === fc) return _focusCache.fc;
+  const keep = correctedSrc
+    ? f => f.properties.carved === true
+    : f => state.hostIds.has(f.properties.osm_id)
+        || (state.correctedIds.size > 0 && !state.correctedIds.has(f.properties.osm_id));
+  const out = {type: 'FeatureCollection', features: fc.features.filter(keep)};
+  _focusCache = {key, src: fc, fc: out};
+  return out;
+}
+
 function buildLayers() {
   const layers = [];
   const modified = state.mode !== 'raw';   // corrected & footprint use the cut footprints
 
   // Buildings: raw (the solid-wall bug) vs modified (span regions cut out).
-  const bdata = modified && state.buildingsCorrected ? state.buildingsCorrected : state.buildings;
+  // useCorrected tracks the dataset actually shown (not just the mode) so focus
+  // filters correctly when the corrected data is absent (Phase 0 falls to raw).
+  const useCorrected = !!(modified && state.buildingsCorrected);
+  const bdata = focusFilter(useCorrected ? state.buildingsCorrected : state.buildings, useCorrected);
+  if (state.baseStatus) {
+    if (state.focusChanges) {
+      const n = bdata ? bdata.features.length : 0;
+      // report only the overlay actually drawn in this mode (spans → corrected,
+      // cuts → footprint; raw draws neither), so the count never overstates.
+      const extra = state.mode === 'corrected' ? ` · ${state.spanItems.length} spans`
+        : state.mode === 'footprint' && state.cuts ? ` · ${state.cuts.features.length} cuts`
+        : '';
+      status.textContent = `focus: ${n} changed buildings${extra}`;
+    } else {
+      status.textContent = state.baseStatus;
+    }
+  }
   if (bdata) {
     layers.push(new GeoJsonLayer({
       id: 'buildings',
@@ -169,6 +215,7 @@ overlay.setProps({onHover: showTip});
 
 document.getElementById('viewMode').onchange = e => { state.mode = e.target.value; buildLayers(); };
 document.getElementById('toggleMissing').onchange = e => { state.showMissing = e.target.checked; buildLayers(); };
+document.getElementById('toggleFocus').onchange = e => { state.focusChanges = e.target.checked; buildLayers(); };
 document.getElementById('flyFocus').onclick = () =>
   map.flyTo({center: FOCUS.center, zoom: FOCUS.zoom, pitch: FOCUS.pitch, bearing: FOCUS.bearing});
 
@@ -186,10 +233,29 @@ map.on('load', async () => {
   state.skybridges = await loadJSON('data/skybridges.geojson');   // may not exist yet (Phase 0)
   state.cuts = await loadJSON('data/cuts.geojson');               // Phase 2+ (modified footprint)
   state.spanItems = explodeSpans(state.skybridges);
+  // Sets that drive focus mode (built from the corrected dataset):
+  //   correctedIds — every osm_id present after correction; a raw building NOT
+  //     in here was lifted into a span, so focus keeps it visible in raw mode.
+  //   hostIds      — the carved hosts (a span cuts into them); the buildings a
+  //     correction touches in every mode.
+  state.hostIds = new Set();
+  state.correctedIds = new Set();
+  for (const f of (state.buildingsCorrected && state.buildingsCorrected.features) || []) {
+    state.correctedIds.add(f.properties.osm_id);
+    if (f.properties.carved) state.hostIds.add(f.properties.osm_id);
+  }
+  // Nothing changed → nothing to focus on: disable the toggle (Phase-0 / raw
+  // regions) so it can't blank the map.
+  const focusEl = document.getElementById('toggleFocus');
+  if (!state.spanItems.length && !state.hostIds.size) {
+    focusEl.disabled = true;
+    focusEl.parentElement.title = 'no corrections detected yet — run `make sql && make export`';
+  }
   const nb = state.buildings ? state.buildings.features.length : 0;
   const ns = state.spanItems.length;
-  status.textContent = `${nb.toLocaleString()} buildings · ${ns} detected spans`
+  state.baseStatus = `${nb.toLocaleString()} buildings · ${ns} detected spans`
     + (ns ? '' : ' (run `make sql && make export` to detect spans)');
+  status.textContent = state.baseStatus;
   buildLayers();
 });
 </script>
