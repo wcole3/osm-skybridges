@@ -10,3 +10,6 @@
 .DS_Store
 *.swp
 .vscode/dostuff/
+
+# workspace
+graphify-out/*
