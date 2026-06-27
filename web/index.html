@@ -162,7 +162,10 @@ function buildLayers() {
       material: {ambient: 0.45, diffuse: 0.6, shininess: 16},
       pickable: true,
       autoHighlight: true,
-      highlightColor: [255, 255, 160, 120],
+      // OPAQUE highlight: a semi-transparent highlight over an extruded polygon
+      // double-draws at every tessellation triangle edge, revealing a "fan" of
+      // thin triangles on the hovered building. Opaque overwrites instead.
+      highlightColor: [235, 225, 165, 255],
       updateTriggers: {getFillColor: [state.showMissing]}
     }));
   }

@@ -121,5 +121,18 @@ docs use is defined below in plain language, roughly grouped by topic. You do
   and the floating geometry to draw.
 - **Cut / carve** — subtracting a span's footprint from its host building so the
   street opening shows through underneath (the "modified footprint").
+- **`cut_expand`** — a tunable (in the `config` table) that grows each cut outward
+  toward the building façade before subtracting it, so the opening reaches the wall
+  instead of leaving a thin remnant "wall." The "cut knob." Adjust with
+  `make tune KEY=cut_expand VAL=…`. See [geometry-quality.md](geometry-quality.md).
+- **Config table / knob** — `config(key, value)`: every numeric threshold the pipeline
+  uses (cut size, clearances, aspect ratio, simplification, …). Defaults live in
+  `sql/01_prepare.sql`; `make config` lists them, `make tune` changes one.
+- **Sliver / spike / thin "wall"** — degenerate bits of geometry: a near-zero-area
+  triangle, a thin protrusion, or a hairline remnant of a building left after a cut.
+  The cleanup layer detects and removes them (see [geometry-quality.md](geometry-quality.md)).
+- **Lifted-only** — a building so fully covered by a span that carving it would leave
+  only a hairline remnant; instead it is shown purely as the lifted span (the grounded
+  footprint is dropped), like a tagged bridge structure.
 - **QA queue** — `qa/qa_flags.geojson`: the ranked list of candidates for a human to
   review, with links back to OpenStreetMap.

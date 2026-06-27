@@ -22,7 +22,31 @@ CREATE TABLE config (key text PRIMARY KEY, value double precision);
 INSERT INTO config VALUES
   ('level_height', 3.0),     -- metres per building level
   ('aspect_min',   4.0),     -- min oriented-bbox aspect ratio for untagged spans
-  ('default_top',  8.0);     -- fallback building height for rendering only
+  ('default_top',  8.0),     -- fallback building height for rendering only
+  -- ── geometry-correction tunables (05_correct.sql) ──────────────────────
+  ('corridor_halfwidth',   9.0),   -- half-width (m) of a passage corridor slab
+  ('corridor_reach',      20.0),   -- (m) extend the passage line past each end to clear the wall
+  ('corridor_reach_cap',  60.0),   -- (m) hard cap on the corridor extension
+  ('footbridge_halfwidth', 2.0),   -- half-width (m) of a footbridge deck
+  ('snap_tol',             0.5),   -- (m) snap the corridor onto the host facade (wall-following)
+  ('simplify_tol',         0.1),   -- (m) drop near-collinear vertices from carved hosts (anti-fan)
+  ('building_simplify_tol',0.5),   -- (m) Douglas-Peucker tol for ALL exported buildings: removes dense near-collinear/narrow-triangle vertices (OSM over-noding) so extruded tops don't tessellate into sliver-fans
+  -- ── severe-geometry detection + auto-clean (passage spans) ─────────────
+  ('open_k',               0.5),   -- (m) morphological-opening radius for spans
+  ('open_k_cut',           0.5),   -- (m) opening radius for cuts: smooths connected thin tongues
+  ('min_cut_inradius',     1.5),   -- (m) a span must overlap a building by a part >= this to cut it (drops grazing-neighbour slivers)
+  ('max_cut_aspect',      10.0),   -- drop cut parts longer-than-this:1 (suppress long thin passage-ribbon cuts; span still lifts)
+  ('cut_expand',           1.0),   -- (m) MODELER KNOB: dilate each cut toward the facade (clipped to host) so it slices the thin remnant "walls" the span left un-cut. 0 disables; raise to cut more, but too high empties hosts (over-cut).
+  ('max_carve_frac',       0.95),  -- if a building is >= this fraction covered by its cut, it IS essentially the span: render it lifted-only (drop the grounded hairline remnant) instead of carving a thin wall.
+  ('open_area_keep',       0.7),   -- skip opening if it would remove > 30% of the area
+  ('min_part_area',        1.0),   -- (m^2) drop disjoint parts smaller than this
+  ('min_inradius',         1.0),   -- (m) per-part keep floor (true min half-width)
+  ('min_compactness',      0.25),  -- Polsby-Popper keep floor (OR'd with inradius)
+  ('severe_inradius',      0.5),   -- (m) below this a span is "still severe" -> revert + review
+  ('vw_area_tol',          0.5),   -- (m^2) Visvalingam-Whyatt area floor: collapses thin spikes Douglas-Peucker preserves (QEM edge-collapse analog; see simplify_vw)
+  ('hard_min_inradius',    0.35),  -- (m) absolute thin-floor in despike/prune: drop ANY part below this inradius regardless of compactness (kills slivers kept on compactness alone)
+  ('clean_area_loss_max',  0.30),  -- revert + review if cleanup loses more than this fraction
+  ('hull_frac',            0.85);  -- ST_SimplifyPolygonHull vertex fraction (reserved; span polish)
 
 -- Metric CRS for the whole pipeline: explicit :srid if > 0, else the UTM zone
 -- of the data's bounding-box centre (EPSG 326xx north / 327xx south).

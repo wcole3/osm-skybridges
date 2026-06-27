@@ -7,20 +7,9 @@
 -- Requiring all four together rejects DC rowhouses (elongated but cross nothing)
 -- and ordinary buildings straddling a passage at ground level.
 
-BEGIN;
+-- mbr_aspect (oriented-bbox long/short ratio) is defined in 00_init.sql.
 
--- long-side / short-side of the minimum-area rotated rectangle
-CREATE OR REPLACE FUNCTION mbr_aspect(g geometry) RETURNS double precision AS $$
-DECLARE r geometry; a double precision; b double precision;
-BEGIN
-  r := ST_ExteriorRing(ST_OrientedEnvelope(g));
-  IF r IS NULL THEN RETURN NULL; END IF;
-  a := ST_Distance(ST_PointN(r,1), ST_PointN(r,2));
-  b := ST_Distance(ST_PointN(r,2), ST_PointN(r,3));
-  IF LEAST(a,b) = 0 THEN RETURN NULL; END IF;
-  RETURN GREATEST(a,b) / LEAST(a,b);
-END;
-$$ LANGUAGE plpgsql IMMUTABLE;
+BEGIN;
 
 WITH cfg AS (
   SELECT (SELECT value FROM config WHERE key='aspect_min') AS aspect_min

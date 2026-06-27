@@ -47,7 +47,7 @@ EXPORT_VARS := -v clon=$(strip $(CLON)) -v clat=$(strip $(CLAT)) -v radius=$(str
 # the pipeline stages are order-dependent (data flows db -> sql -> export), so
 # never run them in parallel even under `make -j`.
 .NOTPARALLEL:
-.PHONY: up build download ingest sql export viewer region all reset psql
+.PHONY: up build download ingest sql export viewer region all reset psql tune config
 
 up:
 	# --wait blocks until the healthcheck passes (or fails), bounded by the
@@ -76,6 +76,7 @@ sql:
 	$(PSQL) -f sql/03_detect_geometry.sql
 	$(PSQL) -f sql/04_score_dedupe.sql
 	$(PSQL) -f sql/05_correct.sql
+	$(PSQL) -f sql/99_selfcheck.sql
 
 export:
 	mkdir -p web/data qa
@@ -99,6 +100,27 @@ all: up build region
 
 psql:
 	psql "$(PGURI)"
+
+# show the current tunables (the config table). Run `make all` once first.
+config:
+	@$(PSQL) -c "SELECT key, value FROM config ORDER BY key"
+
+# Tune one config knob and re-derive everything. Defaults live in the config block
+# of sql/01_prepare.sql; this rewrites the chosen one IN PLACE (so it persists) then
+# re-runs the analysis + export. Requires the DB to be loaded (run `make all` once).
+#   make tune KEY=cut_expand     VAL=0.8    # ← the cut knob: slice MORE/less host under spans
+#   make tune KEY=max_carve_frac VAL=0.90   # building >= this fraction cut => lifted-only
+#   make tune KEY=aspect_min     VAL=5      # any config key works
+# See docs/geometry-quality.md for every knob and what it does.
+tune:
+	@test -n "$(KEY)" -a -n "$(VAL)" || { echo "usage: make tune KEY=<config key> VAL=<number>   (see: make config)"; exit 2; }
+	@grep -qE "\('$(strip $(KEY))', *[0-9.]+\)" sql/01_prepare.sql \
+	  || { echo "unknown config key '$(strip $(KEY))'. Known keys:"; $(MAKE) -s config; exit 2; }
+	sed -i -E "s/(\('$(strip $(KEY))', *)[0-9.]+( *\))/\1$(strip $(VAL))\2/" sql/01_prepare.sql
+	@echo ">> set $(strip $(KEY)) = $(strip $(VAL)) in sql/01_prepare.sql — re-deriving…"
+	$(MAKE) sql
+	$(MAKE) export
+	@echo ">> done. $(strip $(KEY)) = $(strip $(VAL)). Hard-refresh the viewer (Ctrl+Shift+R)."
 
 reset:
 	$(COMPOSE) down -v

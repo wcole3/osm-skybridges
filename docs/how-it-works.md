@@ -32,7 +32,7 @@ footprint has no `min_height`, so 3D maps draw a solid block across both streets
    ┌────────────────────┐         ┌────────────────────┐
    │                    │         │████████████████████│  roof
    │   solid building   │   vs.   │                    │  ← open gap (cars pass)
-   │█████ L Street █████ │         │▓▓▓▓▓ L Street ▓▓▓▓▓│  ← street, visible
+   │█████ L Street █████│         │▓▓▓▓▓ L Street ▓▓▓▓▓│  ← street, visible
    └────────────────────┘         └────────────────────┘
 ```
 
@@ -156,6 +156,13 @@ Now we compute the actual fix and the geometry to draw.
 - **The "cut"** goes into `building_cuts`: the region to subtract from the host
   footprint so the street shows through under the lifted piece. A safety guard stops a
   cut from ever erasing a whole building.
+- **Cleanup.** Raw OSM footprints and buffered corridors leave artifacts — spikes,
+  slivers, hairline "walls" where a cut stops short of a façade. A geometry-cleanup
+  layer (shared helpers in `00_init.sql`) makes everything valid, snaps cuts to the
+  real walls, and removes the junk. The amount it cuts is a **tunable knob**,
+  `cut_expand` (how far each cut is grown toward the façade to slice those remnant
+  walls). All such knobs live in the `config` table — adjust one with
+  `make tune KEY=cut_expand VAL=0.8`. **Full reference: [geometry-quality.md](geometry-quality.md).**
 
 ### Stage 6 — Export  (`sql/90`–`93`, `make export`)
 
@@ -217,6 +224,7 @@ so we split each span into single polygons first.)
 
 ## 6. Where to go next
 
+- Want to **tune the cut/cleanup** (e.g. `cut_expand`)? → [geometry-quality.md](geometry-quality.md)
 - Want to **change or extend** something? → [CONTRIBUTING.md](../CONTRIBUTING.md)
 - Want to **push fixes back to OpenStreetMap**? → [osm-contribution-loop.md](osm-contribution-loop.md)
 - Want the **file-by-file map** and commands? → [README.md](../README.md)

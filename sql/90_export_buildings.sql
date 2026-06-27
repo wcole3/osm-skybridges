@@ -4,6 +4,10 @@
 --   top_h        render height (m, never null)
 --   base_h       resolved float base (m; 0 unless min_height/min_level tagged)
 --   missing_base whether the float base is absent (candidate gate)
+-- building_simplify_tol: strip dense near-collinear / narrow-triangle vertices
+-- (OSM over-noding) so the extruded top doesn't tessellate into a sliver-fan.
+-- Douglas-Peucker preserves topology + validity. COALESCE so a stale DB can't NULL it.
+SELECT COALESCE((SELECT value FROM config WHERE key='building_simplify_tol'), 0.5) AS building_simplify_tol \gset
 SELECT json_build_object(
   'type', 'FeatureCollection',
   'features', COALESCE(json_agg(f), '[]'::json)
@@ -11,7 +15,7 @@ SELECT json_build_object(
 FROM (
   SELECT json_build_object(
     'type', 'Feature',
-    'geometry', ST_AsGeoJSON(geom_4326, 6)::json,
+    'geometry', ST_AsGeoJSON(ST_Transform(ST_SimplifyPreserveTopology(geom_m, :building_simplify_tol), 4326), 6)::json,
     'properties', json_build_object(
       'osm_id', osm_id,
       'kind', CASE WHEN building IS NOT NULL THEN 'building'

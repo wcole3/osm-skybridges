@@ -11,7 +11,9 @@ flagship test case is the Walter E. Washington Convention Center (`osm_id=553164
 which spans L St and M St NW.
 
 Read `docs/how-it-works.md` for the full architecture narrative and `docs/glossary.md`
-for terminology. `CONTRIBUTING.md` has change recipes.
+for terminology. `CONTRIBUTING.md` has change recipes. **`docs/geometry-quality.md`
+documents the geometry-cleanup pipeline and every `config` tunable (incl. the `cut_expand`
+knob) — read it before touching `05_correct.sql` or the cut/carve geometry.**
 
 ## Commands
 
@@ -26,17 +28,24 @@ make viewer     # serve the 3D viewer at http://localhost:8000 (static)
 make psql       # open a DB shell
 make reset      # drop the DB volume (start clean)
 make ingest     # reload OSM after editing pipeline/flex.lua
+make config     # list the config-table tunables and their current values
+make tune KEY=cut_expand VAL=0.8   # change one config knob, persist it (edits 01_prepare.sql), re-derive + re-export
 ```
 
 ### Dev loop
 `edit sql/*.sql → make sql → make export → hard-refresh browser (Ctrl+Shift+R)`.
-Viewer-only edits (`web/index.html`) need just a refresh.
+Viewer-only edits (`web/index.html`) need just a refresh. To adjust a numeric
+threshold instead of editing SQL, use `make tune KEY=<config key> VAL=<n>` (see
+`docs/geometry-quality.md` for every knob, esp. `cut_expand` = how much host to slice
+out under a span).
 
 ### Verification (there is no test framework — use this instead)
 The gold-standard check is a clean rebuild: `make reset && make all` must exit 0.
-Then assert invariants in `make psql` (all must return 0): `corrected_spans` with
-`base_h >= top_h`; empty/invalid `geom_m` in `corrected_spans`; empty/invalid `cut_m`
-in `building_cuts`; `buildings` with `NOT ST_IsValid(geom_m)` or `height_render < 0`.
+`make sql` runs `sql/99_selfcheck.sql`, which **fails the build** on the core invariants
+(`corrected_spans` with `base_h >= top_h`; empty/invalid/non-polygonal `geom_m`;
+empty/invalid `cut_m`; and the WEWCC regression below) and prints warn-only counts for
+still-thin geometry. Also assert in `make psql` (all 0): `buildings` with
+`NOT ST_IsValid(geom_m)` or `height_render < 0`.
 Regression: `SELECT count(*) FROM skybridge_candidates WHERE osm_id=55316481 AND class='passage'` should be 4.
 
 ### Switch regions (auto-detects the UTM zone — no CRS step)
@@ -67,10 +76,19 @@ Detection classes (in `cand_raw.class`): `bridge_struct` (tagged `building=bridg
 an obstacle AND touches 2 buildings AND missing base). Confidence → `action` of
 `auto_correct` / `review` / `inventory`.
 
-Correction: `min_height = clearance_floor` (~4.5/5/6 m for road/covered/rail);
-passages get their corridor sliced edge-to-edge (the passage line is `extend_line`'d
-60 m past both building faces first); `building_cuts` is subtracted from hosts to make
-the "modified footprint."
+Correction: `min_height = clearance_floor` (~4.5/5/6 m for road/covered/rail). A passage
+corridor is buffered (capped mitre — no spikes), extended by `corridor_reach` past both
+faces, **snapped to the host walls** (wall-following), and `clean_span`'d; the same notch
+feeds the span and the `building_cuts`. `building_cuts` is subtracted from hosts to make
+the "modified footprint." A whole geometry-cleanup layer (shared helpers in `00_init.sql`:
+`clean_span`, `drop_tiny_parts`, `despike_parts`, `prune_parts`, `drop_ribbons`,
+`morph_open`, `qa_*`) removes spikes/slivers/ribbons; the cut is then dilated by the
+**`cut_expand`** knob (default 0.6 m, clipped to host, over-cut-guarded) to slice the thin
+remnant "walls", and near-fully-cut hosts (`max_carve_frac`) render lifted-only. All of
+this is tunable in the `config` table — **see `docs/geometry-quality.md`** (it documents
+every knob and the `make tune` workflow). Exports `90/92` simplify buildings
+(`building_simplify_tol`) and the viewer's hover-highlight is opaque to avoid a
+tessellation "fan" — both are anti-sliver-fan, not geometry bugs.
 
 ### Two coordinate columns — do not mix them
 - `geom_m` — metric UTM (from `region_srid()`). **All distance/area/crossing math uses

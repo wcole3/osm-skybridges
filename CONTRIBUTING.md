@@ -30,6 +30,8 @@ Useful one-off commands:
 | `make sql` | re-run the analysis SQL (after editing `sql/*.sql`) |
 | `make export` | re-write the GeoJSON the viewer reads |
 | `make psql` | open a database shell to poke around |
+| `make config` | list the tunable `config` values |
+| `make tune KEY=… VAL=…` | change one tunable, persist it, and re-derive (see §4) |
 | `make reset` | wipe the database volume (start clean) |
 
 ---
@@ -75,8 +77,9 @@ sql/
   92_export_corrected_*.sql │
   93_export_cuts.sql        ┘
   91_export_qa.sql          the human review queue (qa/qa_flags.geojson)
+  99_selfcheck.sql          fail-fast geometry invariants (run last by `make sql`)
 web/index.html              the deck.gl + MapLibre 3D viewer (one static file)
-docs/                       glossary, how-it-works, OSM contribution guide
+docs/                       glossary, how-it-works, geometry-quality (tuning), OSM loop
 ```
 
 The SQL files run **in number order** and each builds on the previous one's tables.
@@ -105,21 +108,31 @@ make viewer
 The metric coordinate system is auto-detected, so you only supply the data URL and a
 camera point. To make it permanent, `cp region.example.mk region.mk` and edit it.
 
-### …tune a threshold (aspect ratio, clearance, default height)
+### …tune a threshold (cut size, aspect ratio, clearance, default height)
 
-These live in two places:
+**All numeric tunables live in the `config` table** (defaults in the labelled block at
+the top of `sql/01_prepare.sql`). The easiest way to change one:
 
-- **`sql/01_prepare.sql`**, the `config` table near the top: `level_height` (metres
-  per floor, default 3.0), `aspect_min` (untagged-span shape threshold, default 4.0),
-  `default_top` (fallback building height, default 8.0).
-- **`sql/05_correct.sql`**: the corridor half-width (9 m), the passage line extension
-  (60 m), and the clearance heights (4.5/5.0/6.0 m) in `clearance_floor`.
+```bash
+make config                          # list every knob + current value
+make tune KEY=cut_expand VAL=0.8     # change it, persist it, re-derive + re-export
+```
 
-Change the value, `make sql && make export`, refresh. To see the effect on the count:
+`make tune` rewrites the default in `sql/01_prepare.sql` (so it persists and shows in
+`git diff`), then runs `make sql` + `make export`; then hard-refresh the viewer. It
+works for any key — e.g. `aspect_min` (untagged-span shape threshold), `cut_expand`
+(how much host to slice out under a span — the one you reach for when openings leave
+thin "walls"), `corridor_halfwidth`, `clearance_*`, `level_height`, `default_top`.
+
+**Every knob is documented in [docs/geometry-quality.md](docs/geometry-quality.md)** —
+what it does, its default, and which way to turn it. To see the effect on the count:
 
 ```sql
 SELECT class, count(*) FROM skybridge_candidates GROUP BY 1;
 ```
+
+(Clearance heights themselves — 4.5/5.0/6.0 m — are still literals in
+`clearance_floor` in `sql/05_correct.sql`; edit there if you need to change them.)
 
 ### …add a new detection rule
 
@@ -155,15 +168,22 @@ before you commit. The gold-standard check is a clean rebuild from zero:
 make reset && make all
 ```
 
-This must finish with exit code 0. Then sanity-check invariants in `make psql`:
+This must finish with exit code 0. Most invariants are now enforced automatically:
+`make sql` runs [`sql/99_selfcheck.sql`](sql/99_selfcheck.sql), which **aborts the
+build** if any of them fail. You can also assert them by hand in `make psql`:
 
 ```sql
 -- these should all return 0
 SELECT count(*) FROM corrected_spans   WHERE base_h >= top_h;                       -- floats must be below their tops
 SELECT count(*) FROM corrected_spans   WHERE ST_IsEmpty(geom_m) OR NOT ST_IsValid(geom_m);
+SELECT count(*) FROM corrected_spans   WHERE GeometryType(geom_m) NOT IN ('POLYGON','MULTIPOLYGON');  -- viewer needs polygons
 SELECT count(*) FROM building_cuts     WHERE ST_IsEmpty(cut_m)  OR NOT ST_IsValid(cut_m);
 SELECT count(*) FROM buildings         WHERE height_render < 0;                     -- no negative heights
 ```
+
+If you change the cleanup/cut geometry, also see
+[docs/geometry-quality.md](docs/geometry-quality.md) §6 — and remember thin "walls",
+slivers, and tessellation fans often only show up **visually**, so eyeball the viewer.
 
 And confirm the flagship example still works (Washington DC):
 
