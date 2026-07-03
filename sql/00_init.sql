@@ -64,14 +64,36 @@ $$ LANGUAGE plpgsql IMMUTABLE;
 -- ST_MakeValid is not formally immutable across GEOS versions.
 -- ===========================================================================
 
+-- cfg: config lookup with a default, safe to call before 01_prepare has created
+-- the config table (00 runs first on a fresh DB). plpgsql on purpose: an SQL-body
+-- function referencing config would fail body validation when the table is absent.
+CREATE OR REPLACE FUNCTION cfg(k text, def double precision) RETURNS double precision AS $$
+BEGIN
+  RETURN COALESCE((SELECT value FROM config WHERE key = k), def);
+EXCEPTION WHEN undefined_table THEN
+  RETURN def;
+END $$ LANGUAGE plpgsql STABLE;
+
 -- clean_span: the canonical "always-valid, polygon-only MultiPolygon" tail.
--- Repair -> keep polygons -> drop duplicate vertices (0.1 m) -> repair -> Multi.
+-- Repair (structure) -> keep polygons -> snap to the fixed-precision grid
+-- (grid_size, m) -> drop duplicate vertices (0.1 m) -> repair -> Multi.
+-- METRIC-ONLY: the grid and the dedupe tolerance are metres; never call this on
+-- geom_4326. The 'structure' MakeValid (node-and-rebuild) runs BEFORE the grid
+-- snap so a self-touching ring cannot be snapped into a bowtie; ST_ReducePrecision
+-- output is valid by GEOS contract, and the trailing repair+extract catches parts
+-- the grid collapses to lines/points. Every buffer-based helper funnels back
+-- through here, so all cleanup output lands on the same grid as the overlay ops
+-- in 05/06 (gridSize args) — near-coincident edges then cancel exactly instead
+-- of leaving hairline slivers.
 -- Returns NULL only for NULL input; an all-non-polygon input yields MULTIPOLYGON EMPTY.
 CREATE OR REPLACE FUNCTION clean_span(g geometry) RETURNS geometry AS $$
   SELECT CASE WHEN g IS NULL THEN NULL ELSE
     ST_Multi(ST_CollectionExtract(
       ST_MakeValid(ST_RemoveRepeatedPoints(
-        ST_CollectionExtract(ST_MakeValid(g), 3), 0.1)), 3))
+        ST_ReducePrecision(
+          ST_CollectionExtract(ST_MakeValid(g, 'method=structure keepcollapsed=false'), 3),
+          cfg('grid_size', 0.01)),
+        0.1), 'method=structure keepcollapsed=false'), 3))
   END
 $$ LANGUAGE sql STABLE;
 

@@ -16,20 +16,81 @@ table** so a modeler can dial it without editing SQL logic.
 
 > TL;DR — to cut **more** (or less) of a building out from under a span:
 > ```bash
-> make tune KEY=cut_expand VAL=0.8      # default 0.6 metres; higher = cut more
+> make tuner                            # drag the cut_expand slider, watch it live
+> make tune KEY=cut_expand VAL=0.8      # or one-shot: default 0.6 m; higher = cut more
 > ```
+
+---
+
+## 0. Fixed-precision geometry — why slivers stopped appearing
+
+Since the precision rework, **every metric overlay runs on a fixed-precision
+grid** (`grid_size`, default **0.01 m**): `ST_Intersection` / `ST_Union` /
+`ST_Difference` get a `gridSize` argument (GEOS OverlayNG snap-rounding) and
+`clean_span` passes everything through `ST_ReducePrecision` +
+`ST_MakeValid(…, 'method=structure')`. Near-coincident edges — a wall-snapped
+corridor against the wall it snapped to — now round to the **same** coordinates
+and cancel exactly, instead of leaving the sub-centimetre hairline slivers the
+part-filters used to chase. The despike/prune/revert machinery below is kept as
+a **backstop** for *real* thin geometry (a genuinely narrow span is thin, not
+noise).
+
+Grid choice: 0.01 m is 10× below `clean_span`'s 0.1 m vertex dedupe and 50× below
+`snap_tol`, so it never fights the wall-following; it is ~7 orders of magnitude
+above float64 noise; and it is invisible at export (the viewer rounds to ~8.7 cm).
+`99_selfcheck` **fails the build** if any cut/span part smaller than
+`(2·grid_size)²` survives — under fixed precision such overlay crumbs must not
+exist. Requires GEOS ≥ 3.10: the compose image is `postgis/postgis:16-3.5-alpine`
+(ships GEOS 3.14); the Debian `postgis/postgis:16-3.5` image ships GEOS 3.9, which
+is why the alpine variant is pinned.
 
 ---
 
 ## 1. Tuning knobs the easy way
 
 All tunables live in one place: the **`config` table**, populated from the labelled
-block near the top of [`sql/01_prepare.sql`](../sql/01_prepare.sql). Two commands:
+block near the top of [`sql/01_prepare.sql`](../sql/01_prepare.sql) (slider ranges +
+the pipeline **stage** each knob re-runs live next to it in `config_meta`).
 
 ```bash
+make tuner                           # live: sliders + 3D result in seconds (see below)
 make config                          # list every knob and its current value
 make tune KEY=cut_expand VAL=0.8     # change one knob, persist it, re-derive + re-export
+make config-export                   # snapshot all settings -> exports/config.json (shareable)
+make config-load FILE=their.json     # ingest someone's settings + re-derive with them
 ```
+
+**Sharing settings:** `make export` also drops the snapshot at `web/data/config.json`,
+which the plain viewer shows as a read-only "processing settings" panel — so anyone
+looking at the result can see exactly which knob values produced it. To reproduce a
+colleague's output: they run `make config-export` and send you the file; you run
+`make config-load FILE=…` — the values are validated, persisted into
+`sql/01_prepare.sql` (same rewrite as `make tune`, visible in `git diff`), and the
+pipeline re-derives with them.
+
+### The live tuner (`make tuner` / `make tuner-sample`)
+
+`make tuner` serves the viewer with a **tuning panel** (sliders for every knob,
+grouped by re-run cost). It is **sandbox-first**: on startup it copies the raw
+OSM data within `SANDBOX_RADIUS` (default 800 m) of the focus point into a
+separate scratch **database** (`osm_sandbox`), runs the ordinary pipeline files
+against it, and exports to `web/data/sandbox/`. **`make tuner-sample`** seeds the
+sandbox with tiny built-in synthetic fixtures instead
+([`sql/96_sample_data.sql`](../sql/96_sample_data.sql) — one labelled case per
+pathology: remnant wall, grazing neighbour, ribbon cut, island leak, near-full
+carve, …) so it needs **no downloaded region at all** and every knob has a case
+that visibly reacts. Dragging a slider re-runs ONLY
+the affected pipeline suffix on the sandbox (~2–5 s) and refreshes the 3D view —
+the live database, `web/data/*.geojson` and `sql/01_prepare.sql` are untouched.
+Rapid slider changes coalesce (latest value wins; never two runs at once), and a
+selfcheck failure shows as a red banner while the viewer keeps the last good
+data. Then, explicitly:
+
+- **apply to real dataset** — push the tuned values to the live `config`,
+  re-derive the live database (stage-scoped) and rewrite `web/data/`.
+- **save as defaults** — persist the values into `sql/01_prepare.sql`
+  (byte-identical to what `make tune` writes, so it shows in `git diff`).
+- **revert** — back to the file defaults; **reseed** — rebuild the sandbox.
 
 `make tune`:
 1. rewrites that knob's default in `sql/01_prepare.sql` (so the change **persists**
@@ -77,6 +138,10 @@ cut_expand = 0                 cut_expand = 0.6 (default)
   ≥ 90 % of the footprint (i.e. carve it to almost nothing), that host keeps its
   *unexpanded* cut instead — so a too-high value can't empty a building or paint a
   whole footprint red. Very high values simply stop helping those borderline hosts.
+- It may only **grow** the cut: dilating then clipping to the host can leak through
+  a thin interior wall into a *disconnected* pocket and spawn a stray crumb there,
+  so any expanded part that doesn't touch the unexpanded cut is dropped (if all
+  parts drop, the unexpanded cut is kept).
 
 ```bash
 make tune KEY=cut_expand VAL=1.0    # cut more aggressively
@@ -94,8 +159,14 @@ raise it toward `1.0` to keep carving them.
 
 ## 3. Every knob
 
-Defaults in [`sql/01_prepare.sql`](../sql/01_prepare.sql); change with `make tune`.
-All distances are **metres** in the metric (UTM) CRS.
+Defaults in [`sql/01_prepare.sql`](../sql/01_prepare.sql); change with `make tuner`
+(live) or `make tune` (one-shot). All distances are **metres** in the metric (UTM)
+CRS. Each knob's slider range and its **stage** — the pipeline suffix that re-runs
+when it changes (`prepare` 01→ / `detect` 02→ / `correct` 05→ / `finalize` 06→ /
+`export`) — live in the `config_meta` table and are shown in the tuner panel; the
+tables below are grouped accordingly (all "corridor"/"severe"/"cut" knobs are stage
+`correct`; `simplify_tol` + `max_carve_frac` are `finalize`; `building_simplify_tol`
+is `export`; `grid_size` is `prepare`).
 
 ### Corridor construction (the passage span) — used in `05_correct.sql`
 | key | default | what it does |
@@ -118,6 +189,12 @@ All distances are **metres** in the metric (UTM) CRS.
 | `severe_inradius` | 0.5 | below this a span is "still severe" → revert + route to review |
 | `hard_min_inradius` | 0.35 | absolute thin-floor in `despike_parts`/`prune_parts`: drop ANY part below this inscribed radius regardless of compactness (kills slivers kept on compactness alone) |
 | `clean_area_loss_max` | 0.30 | revert + review if cleanup loses more than this fraction |
+| `hull_frac` | 0.85 | `ST_SimplifyPolygonHull` vertex fraction (**reserved** — staged for span polish, not wired yet) |
+
+### Precision (§0)
+| key | default | what it does |
+|---|---|---|
+| `grid_size` | 0.01 | (m) fixed-precision grid for every metric overlay + `clean_span`; overlay slivers cancel at the source. 0 disables (not recommended) |
 
 ### Cut shaping
 | key | default | what it does |
@@ -183,12 +260,20 @@ are whole real structures); footbridge decks use flat/mitre caps (no rounded arc
 overlapping span∩building clips is passed through an **overlap-substance gate**
 (`min_cut_inradius` — drops thin grazes of neighbour buildings), then `simplify_vw`
 (collapse thin spikes), `prune_parts`, `drop_ribbons`, `morph_open`, and finally the
-**`cut_expand`** dilation (§2).
+**`cut_expand`** dilation (§2). The expansion may only **grow** the cut: dilating
+then clipping to the host can leak through a thin wall into a disconnected pocket
+and spawn a crumb island, so expanded parts that don't touch the unexpanded cut
+are dropped (all-dropped → the unexpanded cut is kept).
 
-**Carve** ([`92_export_corrected_buildings.sql`](../sql/92_export_corrected_buildings.sql)):
-building − cut, with the cut snapped to that host's walls, made valid, thin spikes
-collapsed (`simplify_vw`), leftover slivers dropped, near-collinear vertices simplified,
-and near-fully-cut hosts sent to lifted-only (`max_carve_frac`).
+**Carve** ([`06_finalize.sql`](../sql/06_finalize.sql)): building − cut
+(fixed-precision `ST_Difference`), with the cut snapped to that host's walls, made
+valid, thin spikes collapsed (`simplify_vw`), leftover slivers dropped,
+near-collinear vertices simplified, and near-fully-cut hosts sent to lifted-only
+(`max_carve_frac`). The result is materialized ONCE in `carved_hosts` and exposed
+as **`buildings_final`** / **`spans_final`** — the viewer export
+([`92`](../sql/92_export_corrected_buildings.sql)) and the full-fidelity exports
+([`94_export_final_*.sql`](../sql/94_export_final_buildings.sql), `make
+export-final` / `make gpkg`) all read the same carve.
 
 ---
 
@@ -213,7 +298,9 @@ valid. Viewer-only changes need just a browser refresh.
 
 `make sql` runs [`sql/99_selfcheck.sql`](../sql/99_selfcheck.sql), which **fails the
 build** on the true invariants (base ≥ top, empty/invalid/non-polygonal spans,
-empty/invalid cuts, and the flagship Convention Center `osm_id=55316481` passage count
-= 4) and prints warn-only counts for still-thin geometry. After tuning, eyeball the
+empty/invalid cuts, empty/invalid `carved_hosts`, any overlay-crumb part smaller
+than `(2·grid_size)²` — see §0, and the flagship Convention Center
+`osm_id=55316481` passage count = 4) and prints warn-only counts for still-thin
+geometry. After tuning, eyeball the
 result in the viewer too — some things (a wall, a sliver) only show up visually. See
 [CONTRIBUTING.md](../CONTRIBUTING.md) §5 for the full invariant checklist.

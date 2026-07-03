@@ -48,15 +48,19 @@ The project is a **pipeline**: a series of steps, each feeding the next. You run
 with `make` commands. Data flows left to right:
 
 ```
- download → load into database → DETECT → CORRECT → export files → view in browser
-  (.pbf)      (osm2pgsql)        (SQL)     (SQL)     (GeoJSON)      (deck.gl)
+ download → load into database → DETECT → CORRECT → FINALIZE → export files → view in browser
+  (.pbf)      (osm2pgsql)        (SQL)     (SQL)      (SQL)     (GeoJSON/GPKG)   (deck.gl)
 ```
 
 Two design choices keep it simple:
 
-1. **SQL-first.** Almost all the logic is plain SQL files (`sql/00`…`sql/05`) run in
-   order by `make sql`. The database (PostGIS) does the geometry math. There's no
-   heavy application code to learn — if you can read SQL, you can read the analysis.
+1. **SQL-first.** Almost all the logic is plain SQL files (`sql/00`…`sql/06`, then the
+   `sql/99` self-check) run in order by `make sql`. The database (PostGIS) does the
+   geometry math — and does it on a **fixed-precision grid** (1 cm), which is why the
+   output has no hairline slivers (see [geometry-quality.md §0](geometry-quality.md)).
+   There's no heavy application code to learn — if you can read SQL, you can read the
+   analysis. (The one Python file, `pipeline/tuner.py`, is just a thin local server
+   for the live tuning panel; it contains no geometry logic.)
 2. **Everything runs in Docker.** You don't install Postgres or mapping tools; Docker
    starts them for you. The only things you need locally are `docker`, `make`,
    `psql`, and `python3` (all standard).
@@ -155,30 +159,60 @@ Now we compute the actual fix and the geometry to draw.
   through (otherwise a too-short OSM line leaves a half-cut).
 - **The "cut"** goes into `building_cuts`: the region to subtract from the host
   footprint so the street shows through under the lifted piece. A safety guard stops a
-  cut from ever erasing a whole building.
-- **Cleanup.** Raw OSM footprints and buffered corridors leave artifacts — spikes,
-  slivers, hairline "walls" where a cut stops short of a façade. A geometry-cleanup
-  layer (shared helpers in `00_init.sql`) makes everything valid, snaps cuts to the
-  real walls, and removes the junk. The amount it cuts is a **tunable knob**,
-  `cut_expand` (how far each cut is grown toward the façade to slice those remnant
-  walls). All such knobs live in the `config` table — adjust one with
+  cut from ever erasing a whole building, and the `cut_expand` dilation may only
+  *grow* a cut — it can never leak a stray crumb into a disconnected pocket.
+- **Precision.** Every geometry operation here runs on a **fixed-precision grid**
+  (`grid_size`, 1 cm): near-coincident edges — a corridor snapped onto the very wall
+  it follows — round to the *same* coordinates and cancel exactly, instead of leaving
+  sub-centimetre sliver polygons. That, plus a cleanup layer (shared helpers in
+  `00_init.sql`) that makes everything valid and drops any residual junk, is why the
+  output is sliver-free. The main **tunable knob** is `cut_expand` (how far each cut
+  is grown toward the façade to slice remnant walls). All knobs live in the `config`
+  table — drag them live with `make tuner`, or one-shot with
   `make tune KEY=cut_expand VAL=0.8`. **Full reference: [geometry-quality.md](geometry-quality.md).**
 
-### Stage 6 — Export  (`sql/90`–`93`, `make export`)
+### Stage 6 — Finalize  (`sql/06_finalize.sql`)
+
+The correction so far lives in *pieces* (spans + cuts). This stage assembles the
+**final geometry** once, so every consumer reads the same result:
+
+- `carved_hosts` — each cut host's footprint with the opening subtracted
+  (building − cut, on the precision grid). Hosts that are ~entirely span become
+  **lifted-only** (they render floating, with no grounded remnant).
+- `buildings_final` — **every** building with corrections applied: carved where a
+  span opens it, untouched raw OSM geometry otherwise.
+- `spans_final` — the floating pieces with their computed `min_height` / `height`.
+
+After it, `sql/99_selfcheck.sql` **fails the whole build** if any invariant breaks:
+invalid/empty geometry anywhere, a span whose base ≥ top, any overlay crumb smaller
+than the precision grid allows, or the flagship convention-center regression (its 4
+passages must all be detected).
+
+### Stage 7 — Export  (`sql/90`–`94`, `make export` / `make export-final` / `make gpkg`)
 
 SQL can output JSON, so each export file is one query that builds a **GeoJSON**
-`FeatureCollection`:
+`FeatureCollection`. Two audiences:
+
+**For the viewer** (`make export`; focus-filtered + simplified for rendering):
 
 - `web/data/buildings.geojson` — every building (the raw, "buggy" view).
-- `web/data/buildings_corrected.geojson` — buildings with span regions cut out.
+- `web/data/buildings_corrected.geojson` — the carved footprints (from `buildings_final`).
 - `web/data/skybridges.geojson` — the floating spans (with their `base`/`top` heights).
 - `web/data/cuts.geojson` — the removed regions (drawn flat red).
 - `web/data/meta.json` — where the viewer's camera should start (per region).
 - `qa/qa_flags.geojson` — the **review queue**: one point per candidate, ranked, with
   a link back to OpenStreetMap and the proposed `min_height`. This is the analysis
   product a human acts on.
+- (`web/data/sandbox/…` — the live tuner's private copies; never touched by `make export`.)
 
-### Stage 7 — View  (`web/index.html`, `make viewer`)
+**For other applications** (whole region, full precision, all attributes):
+
+- `make export-final` → `exports/final_buildings.geojson` + `exports/final_spans.geojson`.
+- `make gpkg` → `exports/final.gpkg`, a **GeoPackage** (one file, two layers) that
+  opens directly in QGIS/ArcGIS — written by GDAL's `ogr2ogr` straight from the
+  database.
+
+### Stage 8 — View  (`web/index.html`, `make viewer` / `make tuner`)
 
 A single static HTML page. It loads **MapLibre** for the base map and **deck.gl** for
 the 3D buildings (both from a CDN — no build step). A dropdown switches three views:
@@ -192,6 +226,12 @@ height *into the polygon's Z coordinate* — each corner of the floating piece i
 a Z value equal to its `min_height`, and deck.gl extrudes upward from there. (One
 gotcha handled in the viewer: deck.gl's `SolidPolygonLayer` can't draw a MultiPolygon,
 so we split each span into single polygons first.)
+
+**The live tuner:** `make tuner` serves the same page plus a slider panel for every
+config knob. Experiments run against a **sandbox** copy of the data (or built-in
+synthetic fixtures with `make tuner-sample` — no download needed), update the 3D view
+in a few seconds, and touch nothing real until you explicitly click *apply* / *save*.
+Details in [geometry-quality.md §1](geometry-quality.md).
 
 ---
 
@@ -224,7 +264,8 @@ so we split each span into single polygons first.)
 
 ## 6. Where to go next
 
-- Want to **tune the cut/cleanup** (e.g. `cut_expand`)? → [geometry-quality.md](geometry-quality.md)
+- Want to **tune the cut/cleanup** (e.g. `cut_expand`)? → `make tuner` (live sliders,
+  sandboxed) or `make tuner-sample` (synthetic fixtures, zero setup) → [geometry-quality.md](geometry-quality.md)
 - Want to **change or extend** something? → [CONTRIBUTING.md](../CONTRIBUTING.md)
 - Want to **push fixes back to OpenStreetMap**? → [osm-contribution-loop.md](osm-contribution-loop.md)
 - Want the **file-by-file map** and commands? → [README.md](../README.md)

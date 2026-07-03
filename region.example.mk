@@ -43,3 +43,4 @@ FOCUS_LABEL = convention center
 # instead drop it at data/<REGION>.osm.pbf and skip `make download`).
 
 # SRID = 0          # 0 = auto UTM; set e.g. 3857 for a continent-scale extent
+# SANDBOX_RADIUS = 800   # `make tuner` sandbox subset radius (m) around the focus

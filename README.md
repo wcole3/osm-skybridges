@@ -39,8 +39,14 @@ You need **Docker**, **make**, **psql**, and **python3** — all standard. You d
 install a database or any GIS tools; Docker provides them.
 
 ```bash
-make all       # start the database, load Washington DC, analyze, export  (~2 min)
+make all       # start the database, load Washington DC, analyze, export
 make viewer    # serve the 3D viewer at http://localhost:8000
+```
+
+(First run ~2 min — downloads ~20 MB and builds a Docker image; warm rebuilds are
+~30 s. `make down` stops the containers when you're done, keeping the data.)
+
+```bash
 ```
 
 Open <http://localhost:8000>, click **“fly to convention center”** (the button is
@@ -55,6 +61,21 @@ labeled per region), and use the **view** dropdown to switch between:
 That's the whole loop. To run pieces individually: `make up`, `make sql`,
 `make export`, `make psql`, `make reset`.
 
+Two more things you can do from here:
+
+- **`make tuner`** — the viewer plus a **live tuning panel**: drag the geometry
+  knobs (cut width, cleanup thresholds, …) and watch the 3D result update in a
+  few seconds. Experiments run in a **sandbox** (a small copy of the area around
+  the focus point) — the real dataset is untouched until you click **apply to
+  real dataset**; **save as defaults** persists values into `sql/01_prepare.sql`.
+  **`make tuner-sample`** is the zero-setup variant: it runs on tiny built-in
+  synthetic fixtures (one per geometry pathology), so it works before any
+  `make all` / download.
+- **`make export-final`** / **`make gpkg`** — write the **final corrected
+  geometry** for use in other applications: `exports/final_buildings.geojson` +
+  `exports/final_spans.geojson` (whole region, full precision, all attributes)
+  and `exports/final.gpkg` (GeoPackage, opens in QGIS/ArcGIS).
+
 ---
 
 ## How it works (short version)
@@ -63,15 +84,18 @@ It's a **pipeline** of small steps, mostly plain SQL run by `make`. Data flows l
 to right:
 
 ```
- download → load into PostGIS → DETECT → CORRECT → export GeoJSON → view in browser
-  (.pbf)      (osm2pgsql/flex)   (SQL)     (SQL)      (web/data)     (deck.gl)
+ download → load into PostGIS → DETECT → CORRECT → FINALIZE → export → view in browser
+  (.pbf)      (osm2pgsql/flex)   (SQL)     (SQL)     (SQL)   (GeoJSON/GPKG) (deck.gl)
 ```
 
 - **Detect** finds candidates two ways: by **tags** (e.g. a building that covers a
   `tunnel=building_passage`) and by **shape** (a long thin footprint that crosses a
   road and connects two buildings).
-- **Correct** computes how high each span should float (its road/rail clearance),
-  builds the floating geometry, and "carves" the opening out of the host building.
+- **Correct** computes how high each span should float (its road/rail clearance) and
+  builds the floating geometry + the region to remove. All geometry math runs on a
+  **fixed-precision grid**, so the results are sliver-free.
+- **Finalize** "carves" each opening out of its host building once, producing the
+  final corrected dataset every export reads.
 - The 3D viewer is one static HTML page using **deck.gl** over **MapLibre** — no
   build step; libraries load from a CDN.
 
@@ -105,13 +129,16 @@ the loaded data (one region at a time).
 
 ```
 Makefile              all commands; region config at the top
-docker-compose.yml    the database + tools containers
+docker-compose.yml    the database + tools + gdal containers
 pipeline/flex.lua     which OSM features to load
-sql/00..05            the analysis: prepare → detect → correct  (run in order)
+pipeline/tuner.py     the live tuning server (make tuner / tuner-sample)
+sql/00..06            the analysis: prepare → detect → correct → finalize (in order)
 sql/90..93            turn results into GeoJSON for the viewer
 sql/91                the QA review queue
-web/index.html        the 3D viewer (one static file)
-docs/                 glossary, how-it-works, OSM contribution guide
+sql/94..96            full-fidelity final exports + tuner sandbox/sample seeds
+sql/99                fail-fast self-check (aborts the build on broken geometry)
+web/index.html        the 3D viewer + tuning panel (one static file)
+docs/                 glossary, how-it-works, geometry-quality (tuning), OSM guide
 ```
 
 A file-by-file map and "I want to change X" recipes are in
@@ -123,6 +150,14 @@ A file-by-file map and "I want to change X" recipes are in
 
 - **3D viewer** — `web/index.html` + `web/data/*.geojson`, with the three view modes
   above, plus hover-for-details and a "highlight buildings missing a base" toggle.
+- **Processing settings** — `web/data/config.json` (shown read-only in the viewer's
+  "processing settings" panel) records the knob values the exports were derived
+  with; `make config-export` writes a shareable copy and `make config-load FILE=…`
+  reproduces another user's settings exactly.
+- **Final corrected geometry** (for other applications) — `make export-final` writes
+  `exports/final_buildings.geojson` + `exports/final_spans.geojson` (whole region,
+  full precision, all attributes); `make gpkg` writes the same as
+  `exports/final.gpkg` (GeoPackage — QGIS/ArcGIS-ready).
 - **QA review queue** — `qa/qa_flags.geojson`: one point per candidate, ranked
   `very_high → high → medium`, each with a link back to OpenStreetMap and the proposed
   `min_height` / `building:min_level`. Open it in
@@ -138,8 +173,9 @@ A file-by-file map and "I want to change X" recipes are in
 | Region (extract + camera) | `region.mk` / CLI vars (`REGION`, `PBF_URL`, `CLON`, `CLAT`, `CRADIUS`, `FOCUS_LABEL`) | Washington DC |
 | Metric CRS | `SRID` (Makefile); `0` = auto-derive the UTM zone | auto |
 | Viewer export radius | `CRADIUS` (metres); raise for a wider area | 2600 m |
-| Storey height, aspect threshold, default height | `config` table in `sql/01_prepare.sql` | 3.0 m, 4.0, 8.0 m |
-| Corridor half-width, passage extension, clearances | `sql/05_correct.sql` | 9 m, 60 m, 4.5/5.0/6.0 m |
+| Tuner sandbox radius | `SANDBOX_RADIUS` (metres around the focus) | 800 m |
+| Every geometry/detection knob (storey height, aspect threshold, corridor half-width + reach, cut size, precision grid, …) | `config` table in `sql/01_prepare.sql` — tune live with `make tuner`, or `make tune KEY=… VAL=…` ([all knobs](docs/geometry-quality.md)) | e.g. 3.0 m, 4.0, 9 m, 20 m |
+| Road/rail clearances (4.5/5.0/6.0 m) | literals in `clearance_floor()`, `sql/05_correct.sql` | 4.5/5.0/6.0 m |
 
 ### Scaling to region / planet
 
@@ -167,5 +203,6 @@ deck.gl `MVTLayer`.
 |---|---|
 | [docs/glossary.md](docs/glossary.md) | every term, in plain language |
 | [docs/how-it-works.md](docs/how-it-works.md) | the full guided tour of the pipeline |
+| [docs/geometry-quality.md](docs/geometry-quality.md) | the precision/cleanup layer + every tunable knob + the live tuner |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | setup, dev loop, "I want to change X" recipes |
 | [docs/osm-contribution-loop.md](docs/osm-contribution-loop.md) | pushing verified fixes back to OSM |

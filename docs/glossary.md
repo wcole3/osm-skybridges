@@ -75,6 +75,11 @@ docs use is defined below in plain language, roughly grouped by topic. You do
   system." UTM and lat/long are both CRSs.
 - **Aspect ratio** — long side ÷ short side of a shape's bounding rectangle. A
   skybridge footprint is long and thin (high aspect ratio); a typical building is not.
+- **Fixed precision / snap-rounding / `grid_size`** — all our metre-based geometry
+  math runs on a 1 cm grid: every operation rounds coordinates to the nearest
+  centimetre, so two edges that are "almost the same line" become **exactly** the
+  same line and cancel cleanly instead of leaving microscopic sliver polygons.
+  `grid_size` is the knob (see [geometry-quality.md §0](geometry-quality.md)).
 
 ## The tools
 
@@ -94,6 +99,12 @@ docs use is defined below in plain language, roughly grouped by topic. You do
   defined in the `Makefile`.
 - **GeoJSON** — a plain-text (JSON) format for geographic shapes. We export our
   results as GeoJSON files the web viewer reads.
+- **GeoPackage (`.gpkg`)** — a single-file geodatabase format that desktop GIS apps
+  (QGIS, ArcGIS) open directly. `make gpkg` writes the final corrected dataset as
+  one, using **GDAL/ogr2ogr** (the standard geodata conversion tool, run in its own
+  Docker container).
+- **GDAL / ogr2ogr** — the swiss-army toolkit for converting geodata between formats
+  and databases; `ogr2ogr` is its converter command.
 
 ## The 3D web viewer
 
@@ -120,14 +131,26 @@ docs use is defined below in plain language, roughly grouped by topic. You do
 - **Correction** — the computed fix: a `min_height` (the floor it should float at)
   and the floating geometry to draw.
 - **Cut / carve** — subtracting a span's footprint from its host building so the
-  street opening shows through underneath (the "modified footprint").
+  street opening shows through underneath (the "modified footprint"). The carve is
+  computed once, in `sql/06_finalize.sql`, into the **`carved_hosts`** table.
+- **`buildings_final` / `spans_final`** — the final-result views (built in
+  `sql/06_finalize.sql`): every building with corrections applied, and every lifted
+  span with its computed `min_height`/`height`. The viewer export, `make
+  export-final` (full-fidelity GeoJSON in `exports/`) and `make gpkg` all read them.
 - **`cut_expand`** — a tunable (in the `config` table) that grows each cut outward
   toward the building façade before subtracting it, so the opening reaches the wall
   instead of leaving a thin remnant "wall." The "cut knob." Adjust with
   `make tune KEY=cut_expand VAL=…`. See [geometry-quality.md](geometry-quality.md).
 - **Config table / knob** — `config(key, value)`: every numeric threshold the pipeline
   uses (cut size, clearances, aspect ratio, simplification, …). Defaults live in
-  `sql/01_prepare.sql`; `make config` lists them, `make tune` changes one.
+  `sql/01_prepare.sql`; `make config` lists them, `make tune` changes one, and
+  `make tuner` gives you live sliders. A companion table, **`config_meta`**, holds
+  each knob's slider range and which pipeline **stage** must re-run when it changes.
+- **Live tuner / sandbox** — `make tuner` serves the viewer plus a slider panel.
+  Experiments run in **`osm_sandbox`**, a separate scratch database holding a small
+  copy of the area around the focus point — the real data changes only when you click
+  *apply*. **`make tuner-sample`** seeds the sandbox with tiny built-in **synthetic
+  fixtures** (one per geometry pathology) instead, so it works with zero setup.
 - **Sliver / spike / thin "wall"** — degenerate bits of geometry: a near-zero-area
   triangle, a thin protrusion, or a hairline remnant of a building left after a cut.
   The cleanup layer detects and removes them (see [geometry-quality.md](geometry-quality.md)).

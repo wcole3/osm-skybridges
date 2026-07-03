@@ -33,6 +33,27 @@ BEGIN
    WHERE cut_m IS NULL OR ST_IsEmpty(cut_m) OR NOT ST_IsValid(cut_m);
   IF n > 0 THEN RAISE EXCEPTION 'selfcheck: % building_cuts with empty/invalid cut_m', n; END IF;
 
+  -- the final carved footprints (06_finalize) must be valid, non-empty,
+  -- polygonal MultiPolygons for every non-lifted-only host
+  SELECT count(*) INTO n FROM carved_hosts
+   WHERE NOT lifted_only
+     AND (geom_m IS NULL OR ST_IsEmpty(geom_m) OR NOT ST_IsValid(geom_m)
+          OR GeometryType(geom_m) <> 'MULTIPOLYGON'
+          OR geom_4326 IS NULL OR ST_IsEmpty(geom_4326) OR NOT ST_IsValid(geom_4326));
+  IF n > 0 THEN RAISE EXCEPTION 'selfcheck: % carved_hosts with empty/invalid/non-multipolygon geometry', n; END IF;
+
+  -- overlay crumbs: parts below (2*grid_size)^2 are float-noise leftovers the
+  -- fixed-precision overlays (grid_size) eliminate at the source. Promoted from
+  -- warn-only to FATAL after holding 0 across full rebuilds; if this ever trips,
+  -- inspect the offending cut/span — do NOT loosen the threshold.
+  SELECT (SELECT count(*) FROM building_cuts c, LATERAL ST_Dump(c.cut_m) d
+           WHERE ST_Area(d.geom) < 4 * gs.g * gs.g)
+       + (SELECT count(*) FROM corrected_spans s, LATERAL ST_Dump(s.geom_m) d
+           WHERE ST_Area(d.geom) < 4 * gs.g * gs.g)
+    INTO n
+  FROM (SELECT COALESCE((SELECT value FROM config WHERE key='grid_size'), 0.01) AS g) gs;
+  IF n > 0 THEN RAISE EXCEPTION 'selfcheck: % overlay-crumb parts (area < (2*grid_size)^2) in cuts/spans', n; END IF;
+
   -- WEWCC regression — only when the flagship building is in this region
   IF EXISTS (SELECT 1 FROM buildings WHERE osm_id = 55316481) THEN
     SELECT count(*) INTO n FROM skybridge_candidates WHERE osm_id = 55316481 AND class = 'passage';

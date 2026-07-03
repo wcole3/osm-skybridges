@@ -24,6 +24,54 @@
     background:#111; color:#fff; padding:6px 8px; border-radius:4px; font-size:12px; max-width:260px;
   }
   button { font: inherit; padding: 4px 8px; border-radius:6px; border:1px solid #bbb; background:#fff; cursor:pointer; }
+
+  /* ── live tuner panel (only shown when `make tuner` is serving /api/*) ── */
+  #sandboxBadge { display:none; background:#7a3ff2; color:#fff; font-weight:600;
+    font-size:11px; padding:1px 7px; border-radius:10px; margin-left:6px; vertical-align:2px; }
+  #tuner { margin-top:8px; border-top:1px solid #ddd; padding-top:6px; display:none; }
+  #tuner summary { cursor:pointer; font-weight:600; }
+  #tuner .stage { margin:6px 0 2px; font-size:11px; text-transform:uppercase;
+    letter-spacing:.4px; color:#666; }
+  #tuner .stage .cost { font-weight:400; color:#999; text-transform:none; }
+  #tuner .knob { display:grid; grid-template-columns: 96px 1fr 52px 16px; gap:5px;
+    align-items:center; margin:2px 0; }
+  #tuner .knob label { margin:0; font-size:12px; overflow:hidden; text-overflow:ellipsis;
+    white-space:nowrap; }
+  #tuner .knob input[type=range] { width:100%; margin:0; }
+  #tuner .knob input[type=number] { width:52px; font-size:11px; padding:1px 2px; }
+  #tuner .knob .undo { visibility:hidden; border:none; background:none; padding:0;
+    font-size:13px; line-height:1; color:#7a3ff2; cursor:pointer; }
+  #tuner .dirty label { font-weight:600; color:#7a3ff2; }
+  #tuner .dirty .undo { visibility:visible; }
+  #tuner .buttons { margin-top:8px; display:flex; gap:6px; flex-wrap:wrap; }
+  #tuner .buttons button { font-size:12px; padding:3px 7px; }
+  #tuner .buttons button:disabled { opacity:.45; cursor:default; }
+  /* status chip: idle (hidden) → running (amber + spinner) → ok (green flash) → err (red) */
+  #tunerStatus { margin-top:6px; font-size:12px; min-height:18px; color:#666; }
+  #tunerStatus .chip { display:inline-block; padding:2px 8px; border-radius:10px; }
+  #tunerStatus.run .chip { background:#fff3d6; color:#7a5200; border:1px solid #e8c874; }
+  #tunerStatus.ok  .chip { background:#e2f6e6; color:#166534; border:1px solid #86d99a; }
+  #tunerStatus.err .chip { background:#fdecec; color:#b00020; border:1px solid #e0b4b4; }
+  #tunerStatus.run .chip::before { content:''; display:inline-block; width:9px; height:9px;
+    margin-right:6px; vertical-align:-1px; border-radius:50%;
+    border:2px solid #c9962a; border-top-color:transparent;
+    animation: tunerspin .8s linear infinite; }
+  @keyframes tunerspin { to { transform: rotate(360deg); } }
+  #tunerStatus pre { max-height:110px; overflow:auto; background:#fff3f3;
+    border:1px solid #e0b4b4; padding:4px; font-size:10px; white-space:pre-wrap;
+    margin:4px 0 0; }
+
+  /* read-only processing-settings panel (plain `make viewer`; hidden when the
+     live tuner is active — its panel shows the same values editable) */
+  #settingsRO { margin-top:8px; border-top:1px solid #ddd; padding-top:6px; display:none; }
+  #settingsRO summary { cursor:pointer; font-weight:600; }
+  #settingsRO .when { font-weight:400; color:#999; font-size:11px; margin-left:4px; }
+  #settingsRO .grid { display:grid; grid-template-columns:auto auto; gap:1px 12px;
+    max-height:220px; overflow-y:auto; margin-top:4px; font-size:11.5px; }
+  #settingsRO .grid span { white-space:nowrap; }
+  #settingsRO .grid .v { text-align:right; font-variant-numeric:tabular-nums; color:#333; }
+  #settingsRO .share { color:#888; font-size:11px; margin-top:4px; }
+  #settingsRO code { background:#f2f2f2; padding:0 3px; border-radius:3px; }
 </style>
 </head>
 <body>
@@ -51,6 +99,27 @@
   </label>
   <button id="flyFocus">↪ fly to focus</button>
   <div id="status">loading…</div>
+
+  <!-- live tuner (populated + shown only when pipeline/tuner.py serves /api/*) -->
+  <details id="tuner" open>
+    <summary>tuning knobs <span id="sandboxBadge">SANDBOX</span></summary>
+    <div id="tunerKnobs"></div>
+    <div class="buttons">
+      <button id="tApply" title="Push the tuned values to the LIVE database, re-derive and re-export web/data/">apply to real dataset</button>
+      <button id="tSave" title="Persist the tuned values as the defaults in sql/01_prepare.sql (same rewrite as `make tune`)">save as defaults</button>
+      <button id="tRevert" title="Reset every knob to the file defaults and re-derive the sandbox">↺ reset all</button>
+      <button id="tReseed" title="Rebuild the sandbox database from the raw data">reseed</button>
+    </div>
+    <div id="tunerStatus"></div>
+  </details>
+
+  <!-- read-only settings (populated from data/config.json under `make viewer`) -->
+  <details id="settingsRO">
+    <summary>processing settings <span class="when"></span></summary>
+    <div class="grid"></div>
+    <div class="share">share: <code>make config-export</code> → send the file →
+      <code>make config-load FILE=…</code></div>
+  </details>
 </div>
 
 <script>
@@ -222,19 +291,14 @@ document.getElementById('toggleFocus').onchange = e => { state.focusChanges = e.
 document.getElementById('flyFocus').onclick = () =>
   map.flyTo({center: FOCUS.center, zoom: FOCUS.zoom, pitch: FOCUS.pitch, bearing: FOCUS.bearing});
 
-map.on('load', async () => {
-  // per-region camera + labels
-  const meta = await loadJSON('data/meta.json');
-  if (meta && meta.center) {
-    FOCUS = Object.assign(FOCUS, meta);
-    map.jumpTo({center: FOCUS.center, zoom: FOCUS.zoom, pitch: FOCUS.pitch, bearing: FOCUS.bearing});
-    document.getElementById('flyFocus').textContent = '↪ fly to ' + (FOCUS.label || 'focus');
-    document.querySelector('#panel h1').textContent = 'OSM Skybridge Viewer — ' + (FOCUS.label || '');
-  }
-  state.buildings = await loadJSON('data/buildings.geojson');
-  state.buildingsCorrected = await loadJSON('data/buildings_corrected.geojson'); // Phase 2+
-  state.skybridges = await loadJSON('data/skybridges.geojson');   // may not exist yet (Phase 0)
-  state.cuts = await loadJSON('data/cuts.geojson');               // Phase 2+ (modified footprint)
+// (Re)load every dataset from `prefix` ('data/' live, 'data/sandbox/' tuner)
+// and rebuild the layers. `bust` busts the browser cache after a tuner re-run.
+async function loadData(prefix, bust) {
+  const v = bust ? `?v=${bust}` : '';
+  state.buildings = await loadJSON(prefix + 'buildings.geojson' + v);
+  state.buildingsCorrected = await loadJSON(prefix + 'buildings_corrected.geojson' + v); // Phase 2+
+  state.skybridges = await loadJSON(prefix + 'skybridges.geojson' + v);   // may not exist yet (Phase 0)
+  state.cuts = await loadJSON(prefix + 'cuts.geojson' + v);               // Phase 2+ (modified footprint)
   state.spanItems = explodeSpans(state.skybridges);
   // Sets that drive focus mode (built from the corrected dataset):
   //   correctedIds — every osm_id present after correction; a raw building NOT
@@ -247,12 +311,15 @@ map.on('load', async () => {
     state.correctedIds.add(f.properties.osm_id);
     if (f.properties.carved) state.hostIds.add(f.properties.osm_id);
   }
+  _focusCache = {key: null, src: null, fc: null};   // datasets changed → stale
   // Nothing changed → nothing to focus on: disable the toggle (Phase-0 / raw
   // regions) so it can't blank the map.
   const focusEl = document.getElementById('toggleFocus');
   if (!state.spanItems.length && !state.hostIds.size) {
     focusEl.disabled = true;
     focusEl.parentElement.title = 'no corrections detected yet — run `make sql && make export`';
+  } else {
+    focusEl.disabled = false;
   }
   const nb = state.buildings ? state.buildings.features.length : 0;
   const ns = state.spanItems.length;
@@ -260,7 +327,165 @@ map.on('load', async () => {
     + (ns ? '' : ' (run `make sql && make export` to detect spans)');
   status.textContent = state.baseStatus;
   buildLayers();
+}
+
+map.on('load', async () => {
+  // per-region camera + labels (always from the live export; the sandbox is a
+  // subset of the same region, so the camera is identical)
+  const meta = await loadJSON('data/meta.json');
+  if (meta && meta.center) {
+    FOCUS = Object.assign(FOCUS, meta);
+    map.jumpTo({center: FOCUS.center, zoom: FOCUS.zoom, pitch: FOCUS.pitch, bearing: FOCUS.bearing});
+    document.getElementById('flyFocus').textContent = '↪ fly to ' + (FOCUS.label || 'focus');
+    document.querySelector('#panel h1').textContent = 'OSM Skybridge Viewer — ' + (FOCUS.label || '');
+  }
+  const tuner = await initTuner();          // detects `make tuner`; null under `make viewer`
+  if (!tuner) initSettingsRO();             // read-only settings panel instead
+  await loadData(tuner ? 'data/sandbox/' : 'data/', 0);
 });
+
+// Read-only processing-settings panel (plain `make viewer`): shows the values
+// the current exports were derived with, from data/config.json (written by
+// `make export`). The live tuner supersedes it — same values, editable.
+async function initSettingsRO() {
+  const cfg = await loadJSON('data/config.json');
+  if (!cfg || !cfg.values) return;          // older export without the snapshot
+  const el = document.getElementById('settingsRO');
+  const grid = el.querySelector('.grid');
+  for (const [key, val] of Object.entries(cfg.values)) {
+    const m = (cfg.meta && cfg.meta[key]) || {};
+    const k = document.createElement('span');
+    k.textContent = key;
+    k.title = (m.descr || '') + (m.stage ? ` [stage: ${m.stage}]` : '');
+    const v = document.createElement('span');
+    v.className = 'v';
+    v.textContent = val;
+    grid.append(k, v);
+  }
+  if (cfg.generated) el.querySelector('.when').textContent =
+    'as of ' + new Date(cfg.generated).toLocaleString();
+  el.style.display = 'block';
+}
+
+// ─── live tuner client ──────────────────────────────────────────────────────
+// Only active when pipeline/tuner.py is serving (GET /api/config succeeds);
+// under plain `make viewer` the fetch 404s and the panel stays hidden.
+async function initTuner() {
+  let cfg = null;
+  try {
+    const r = await fetch('/api/config');
+    if (r.ok) cfg = await r.json();
+  } catch (e) { /* static server → no tuner */ }
+  if (!cfg || !cfg.knobs) return null;
+
+  const el = document.getElementById('tuner');
+  el.style.display = 'block';
+  const badge = document.getElementById('sandboxBadge');
+  badge.style.display = 'inline-block';
+  if (cfg.data_mode === 'sample') {
+    badge.textContent = 'SAMPLE';
+    badge.title = 'synthetic fixture data (make tuner-sample) — one case per geometry pathology';
+  }
+  const tStatus = document.getElementById('tunerStatus');
+  const STAGE_COST = {prepare: 'slowest — full re-derive', detect: 'slow — re-detect',
+                      correct: 'medium — re-correct', finalize: 'fast', export: 'fastest — re-export only'};
+
+  function render(knobs) {
+    const box = document.getElementById('tunerKnobs');
+    box.innerHTML = '';
+    let stage = null;
+    for (const k of knobs) {
+      if (k.stage !== stage) {
+        stage = k.stage;
+        const h = document.createElement('div');
+        h.className = 'stage';
+        h.innerHTML = `${stage} <span class="cost">· ${STAGE_COST[stage] || ''}</span>`;
+        box.appendChild(h);
+      }
+      const row = document.createElement('div');
+      row.className = 'knob' + (k.dirty ? ' dirty' : '');
+      row.innerHTML = `<label title="${k.descr} (default ${k.file_default})">${k.key}</label>
+        <input type="range" min="${k.min}" max="${k.max}" step="${k.step}" value="${k.value}">
+        <input type="number" min="${k.min}" max="${k.max}" step="${k.step}" value="${k.value}">
+        <button class="undo" title="reset ${k.key} to its default (${k.file_default})">↺</button>`;
+      const [range, num] = row.querySelectorAll('input');
+      const set = v => { postSet(k.key, v); row.classList.add('dirty'); };
+      range.oninput = () => { num.value = range.value; };          // live readout
+      range.onchange = () => set(parseFloat(range.value));          // commit on release
+      let deb = null;                                               // debounce typing
+      num.oninput = () => { range.value = num.value;
+        clearTimeout(deb); deb = setTimeout(() => set(parseFloat(num.value)), 300); };
+      row.querySelector('.undo').onclick = () => {                  // per-knob reset
+        range.value = num.value = k.file_default;
+        set(k.file_default);
+        row.classList.remove('dirty');
+      };
+      box.appendChild(row);
+    }
+  }
+  render(cfg.knobs);
+
+  async function postSet(key, value) {
+    setChip('run', `queued ${key}…`);   // instant feedback; poll takes over <1 s later
+    await fetch('/api/set', {method: 'POST', body: JSON.stringify({key, value})});
+  }
+  async function post(path, confirmMsg) {
+    if (confirmMsg && !window.confirm(confirmMsg)) return;
+    setChip('run', 'queued…');
+    const r = await fetch(path, {method: 'POST', body: '{}'});
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok || j.error) setChip('err', '✗ ' + (j.error || r.status));
+  }
+  document.getElementById('tApply').onclick = () =>
+    post('/api/apply', 'Apply the tuned values to the REAL dataset?\nThis re-derives the live database and overwrites web/data/*.geojson.');
+  document.getElementById('tSave').onclick = () =>
+    post('/api/save', 'Write the tuned values into sql/01_prepare.sql as the new defaults?');
+  document.getElementById('tRevert').onclick = () => post('/api/revert');
+  document.getElementById('tReseed').onclick = () =>
+    post('/api/reseed', 'Rebuild the sandbox database from the live raw import?');
+
+  // status poll: drives the status chip, locks the action buttons during a run,
+  // and refetches sandbox data whenever a run completes (run_seq bumps).
+  const actionBtns = ['tApply', 'tSave', 'tRevert', 'tReseed'].map(id => document.getElementById(id));
+  const setChip = (cls, text) => {
+    tStatus.className = cls;
+    tStatus.innerHTML = '<span class="chip"></span>';
+    tStatus.querySelector('.chip').textContent = text;
+  };
+  let lastSeq = cfg.run_seq || 0, lastState = null, okTimer = null;
+  setInterval(async () => {
+    let s = null;
+    try { s = await (await fetch('/api/status')).json(); } catch (e) { return; }
+    const running = s.state === 'running';
+    actionBtns.forEach(b => { b.disabled = running; });
+    if (running) {
+      clearTimeout(okTimer);
+      setChip('run', `re-running ${s.stage} on ${s.mode}…`);
+    } else if (s.state === 'error') {
+      if (lastState !== 'error') {
+        clearTimeout(okTimer);
+        tStatus.className = 'err';
+        tStatus.innerHTML = '<span class="chip">✗ pipeline / selfcheck failed</span>'
+          + '<div>sandbox kept the last good data — back the knob off.</div><pre></pre>';
+        tStatus.querySelector('pre').textContent = s.error_tail || '';
+      }
+    } else if (s.run_seq !== lastSeq) {
+      lastSeq = s.run_seq;
+      setChip('ok', `✓ done in ${s.last_secs}s — ` +
+        (s.mode === 'live' ? 'LIVE dataset updated (web/data/)' : 'view refreshed'));
+      clearTimeout(okTimer);
+      okTimer = setTimeout(() => { if (tStatus.className === 'ok') { tStatus.className = ''; tStatus.textContent = ''; } }, 6000);
+      if (s.mode !== 'live') await loadData('data/sandbox/', lastSeq);
+      // refresh values + dirty markers from the server's view
+      try { const c = await (await fetch('/api/config')).json(); if (c.knobs) render(c.knobs); } catch (e) {}
+    } else if (s.state === 'idle' && lastState === 'running') {
+      // run finished but produced no new data (e.g. coalesced no-op)
+      tStatus.className = ''; tStatus.textContent = '';
+    }
+    lastState = s.state;
+  }, 1000);
+  return cfg;
+}
 </script>
 </body>
 </html>

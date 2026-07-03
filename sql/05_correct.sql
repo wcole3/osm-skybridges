@@ -38,7 +38,8 @@ SELECT
   (SELECT value FROM config WHERE key='severe_inradius')     AS severe_inradius,
   (SELECT value FROM config WHERE key='vw_area_tol')         AS vw_area_tol,
   (SELECT value FROM config WHERE key='hard_min_inradius')   AS hard_min_inradius,
-  (SELECT value FROM config WHERE key='clean_area_loss_max') AS clean_area_loss_max
+  (SELECT value FROM config WHERE key='clean_area_loss_max') AS clean_area_loss_max,
+  (SELECT value FROM config WHERE key='grid_size')           AS grid_size
 \gset
 
 BEGIN;
@@ -122,7 +123,7 @@ CROSS JOIN LATERAL (
                ST_Buffer(extend_line(p.g, LEAST(:corridor_reach_cap, :corridor_reach)),
                          :corridor_halfwidth, 'endcap=flat join=mitre mitre_limit=2.0'),
                ST_Boundary(c.geom_m), :snap_tol),
-             c.geom_m)) AS g
+             c.geom_m, :grid_size)) AS g
 ) notch
 WHERE c.class = 'passage';
 
@@ -240,7 +241,7 @@ DROP TABLE IF EXISTS building_cuts CASCADE;
 CREATE TABLE building_cuts AS
 WITH span_overlap AS (   -- NB: 'overlaps' is a reserved SQL keyword, do not use it
   SELECT b.osm_id AS host_osm_id, b.osm_type AS host_osm_type, b.geom_m AS bgeom,
-         clean_span(ST_Intersection(s.geom_m, b.geom_m)) AS ix
+         clean_span(ST_Intersection(s.geom_m, b.geom_m, :grid_size)) AS ix
   FROM buildings b
   JOIN corrected_spans s
     ON s.geom_m && b.geom_m AND ST_Intersects(s.geom_m, b.geom_m)
@@ -257,7 +258,7 @@ cleaned AS (
   SELECT host_osm_id, host_osm_type,
          morph_open(
            drop_ribbons(
-             prune_parts(simplify_vw(clean_span(ST_Union(ix)), :vw_area_tol),
+             prune_parts(simplify_vw(clean_span(ST_Union(ix, :grid_size)), :vw_area_tol),
                          :min_part_area, :severe_inradius, :min_compactness, :hard_min_inradius),
              :max_cut_aspect),
            :open_k_cut) AS c
@@ -277,9 +278,15 @@ SELECT cl.host_osm_id, cl.host_osm_type,
 FROM cleaned cl
 JOIN buildings b ON b.osm_id = cl.host_osm_id AND b.osm_type = cl.host_osm_type
 CROSS JOIN LATERAL (
-  SELECT clean_span(ST_Intersection(
-           ST_Buffer(cl.c, :cut_expand, 'join=mitre mitre_limit=2.0'),
-           b.geom_m)) AS g
+  -- Expansion may only GROW the cut: dilating then clipping to the host can leak
+  -- through a thin wall into a disconnected pocket, spawning a crumb island
+  -- (seen: 0.4 m^2, r 0.24). Keep only expanded parts that touch the unexpanded
+  -- cut; zero surviving parts -> NULL -> the CASE above keeps cl.c.
+  SELECT clean_span(ST_Collect(d.geom)) AS g
+  FROM ST_Dump(ST_Intersection(
+         ST_Buffer(cl.c, :cut_expand, 'join=mitre mitre_limit=2.0'),
+         b.geom_m, :grid_size)) d
+  WHERE ST_Intersects(d.geom, cl.c)
 ) ex;
 DELETE FROM building_cuts WHERE cut_m IS NULL OR ST_IsEmpty(cut_m);
 CREATE INDEX bcuts_geom_idx ON building_cuts USING gist (cut_m);

@@ -1,6 +1,9 @@
 services:
   db:
-    image: postgis/postgis:16-3.5
+    # -alpine: the Debian 16-3.5 image ships distro GEOS 3.9 — too old for the
+    # fixed-precision pipeline (needs GEOS >= 3.10 for 'method=structure'
+    # ST_MakeValid); the alpine build compiles a modern GEOS (3.14).
+    image: postgis/postgis:16-3.5-alpine
     container_name: osm_skybridge_db
     environment:
       POSTGRES_DB: osm
@@ -15,6 +18,15 @@ services:
       interval: 4s
       timeout: 5s
       retries: 30
+
+  gdal:                     # ogr2ogr/ogrinfo for `make gpkg`, run on demand
+    image: ghcr.io/osgeo/gdal:ubuntu-small-3.10.0
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - ./:/work
+    working_dir: /work
 
   tools:                    # osmium-tool + osm2pgsql, run on demand
     build: ./tools

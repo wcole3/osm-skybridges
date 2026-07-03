@@ -17,6 +17,9 @@ BEGIN;
 
 -- Default storey height (m). Adjustable per region/building type; 3.0 is the
 -- documented OSM default used by F4Map et al.
+-- config_meta drops FIRST: it holds a foreign key into config, so on a re-run
+-- the child must go before the parent (else DROP config errors out).
+DROP TABLE IF EXISTS config_meta;
 DROP TABLE IF EXISTS config;
 CREATE TABLE config (key text PRIMARY KEY, value double precision);
 INSERT INTO config VALUES
@@ -35,8 +38,8 @@ INSERT INTO config VALUES
   ('open_k',               0.5),   -- (m) morphological-opening radius for spans
   ('open_k_cut',           0.5),   -- (m) opening radius for cuts: smooths connected thin tongues
   ('min_cut_inradius',     1.5),   -- (m) a span must overlap a building by a part >= this to cut it (drops grazing-neighbour slivers)
-  ('max_cut_aspect',      10.0),   -- drop cut parts longer-than-this:1 (suppress long thin passage-ribbon cuts; span still lifts)
-  ('cut_expand',           1.0),   -- (m) MODELER KNOB: dilate each cut toward the facade (clipped to host) so it slices the thin remnant "walls" the span left un-cut. 0 disables; raise to cut more, but too high empties hosts (over-cut).
+  ('max_cut_aspect',      20.0),   -- drop cut parts longer-than-this:1 (suppress long thin passage-ribbon cuts; span still lifts)
+  ('cut_expand',           0.6),   -- (m) MODELER KNOB: dilate each cut toward the facade (clipped to host) so it slices the thin remnant "walls" the span left un-cut. 0 disables; raise to cut more, but too high empties hosts (over-cut).
   ('max_carve_frac',       0.95),  -- if a building is >= this fraction covered by its cut, it IS essentially the span: render it lifted-only (drop the grounded hairline remnant) instead of carving a thin wall.
   ('open_area_keep',       0.7),   -- skip opening if it would remove > 30% of the area
   ('min_part_area',        1.0),   -- (m^2) drop disjoint parts smaller than this
@@ -46,7 +49,51 @@ INSERT INTO config VALUES
   ('vw_area_tol',          0.5),   -- (m^2) Visvalingam-Whyatt area floor: collapses thin spikes Douglas-Peucker preserves (QEM edge-collapse analog; see simplify_vw)
   ('hard_min_inradius',    0.35),  -- (m) absolute thin-floor in despike/prune: drop ANY part below this inradius regardless of compactness (kills slivers kept on compactness alone)
   ('clean_area_loss_max',  0.30),  -- revert + review if cleanup loses more than this fraction
-  ('hull_frac',            0.85);  -- ST_SimplifyPolygonHull vertex fraction (reserved; span polish)
+  ('hull_frac',            0.85),  -- ST_SimplifyPolygonHull vertex fraction (reserved; span polish)
+  ('grid_size',            0.01);  -- (m) fixed-precision grid for ALL metric overlays/cleanup (clean_span + gridSize overlay args): near-coincident edges snap-round to the same coordinates so hairline slivers cancel at the source. 10x below clean_span's 0.1 dedupe, 50x below snap_tol; invisible at export (6dp ~ 8.7 cm). 0 disables (not recommended).
+
+-- config_meta: UI metadata for the live tuner (pipeline/tuner.py) — slider
+-- range/step, a one-line description, and the STAGE: the cheapest pipeline
+-- suffix that must re-run when the knob changes (prepare 01→, detect 02→,
+-- correct 05→, finalize 06→, export = re-export only). Kept SEPARATE from
+-- config: `make tune`'s sed matches the ('key', value) rows above and must not
+-- see extra columns. A knob used by several stages gets the heaviest user.
+-- (Dropped above, before config — FK ordering.)
+CREATE TABLE config_meta (
+  key   text PRIMARY KEY REFERENCES config(key),
+  stage text NOT NULL CHECK (stage IN ('prepare','detect','correct','finalize','export')),
+  min   double precision NOT NULL,
+  max   double precision NOT NULL,
+  step  double precision NOT NULL,
+  descr text NOT NULL
+);
+INSERT INTO config_meta VALUES
+  ('level_height',        'prepare',  2.0,  5.0, 0.1,  'metres per building:levels floor'),
+  ('aspect_min',          'detect',   2.0, 10.0, 0.5,  'min bbox aspect for untagged span detection'),
+  ('default_top',         'prepare',  3.0, 30.0, 0.5,  'fallback render height (no height tag)'),
+  ('corridor_halfwidth',  'correct',  3.0, 15.0, 0.5,  'half-width of a passage corridor slab'),
+  ('corridor_reach',      'correct',  5.0, 60.0, 1.0,  'extend passage line past each face'),
+  ('corridor_reach_cap',  'correct', 20.0,120.0, 5.0,  'hard cap on that extension'),
+  ('footbridge_halfwidth','correct',  0.5,  5.0, 0.25, 'half-width of a footbridge deck'),
+  ('snap_tol',            'correct',  0.0,  2.0, 0.05, 'snap corridor/cut onto the host wall'),
+  ('simplify_tol',        'finalize', 0.0,  1.0, 0.05, 'drop near-collinear vertices from carved hosts'),
+  ('building_simplify_tol','export',  0.0,  2.0, 0.05, 'simplify ALL exported buildings (anti-fan)'),
+  ('open_k',              'correct',  0.0,  2.0, 0.05, 'morphological-opening radius for spans'),
+  ('open_k_cut',          'correct',  0.0,  2.0, 0.05, 'opening radius for cuts'),
+  ('min_cut_inradius',    'correct',  0.0,  5.0, 0.1,  'span must overlap host this wide to cut'),
+  ('max_cut_aspect',      'correct',  2.0, 40.0, 1.0,  'drop cut parts longer than this:1'),
+  ('cut_expand',          'correct',  0.0,  3.0, 0.1,  'dilate cut toward the facade (slice walls)'),
+  ('max_carve_frac',      'finalize', 0.5,  1.0, 0.01, 'host cut >= this fraction -> lifted-only'),
+  ('open_area_keep',      'correct',  0.3,  1.0, 0.05, 'skip opening if it removes more area'),
+  ('min_part_area',       'correct',  0.0, 10.0, 0.5,  'drop disjoint parts smaller than this m^2'),
+  ('min_inradius',        'correct',  0.0,  3.0, 0.05, 'per-part keep floor (min half-width)'),
+  ('min_compactness',     'correct',  0.0,  1.0, 0.05, 'Polsby-Popper keep floor'),
+  ('severe_inradius',     'correct',  0.0,  2.0, 0.05, 'below this a span reverts to review'),
+  ('vw_area_tol',         'correct',  0.0,  3.0, 0.1,  'Visvalingam area floor (collapses spikes)'),
+  ('hard_min_inradius',   'correct',  0.0,  1.0, 0.05, 'absolute thin-floor in despike/prune'),
+  ('clean_area_loss_max', 'correct',  0.0,  1.0, 0.05, 'revert if cleanup loses more than this'),
+  ('hull_frac',           'correct',  0.5,  1.0, 0.05, 'SimplifyPolygonHull fraction (reserved)'),
+  ('grid_size',           'prepare',  0.0,  0.1, 0.005,'fixed-precision grid for all overlays');
 
 -- Metric CRS for the whole pipeline: explicit :srid if > 0, else the UTM zone
 -- of the data's bounding-box centre (EPSG 326xx north / 327xx south).
@@ -118,7 +165,15 @@ UPDATE buildings
 
 -- Repair invalid OSM polygons ONCE, at the source, so every downstream ST_*
 -- operation (intersection / crosses / difference / export) is safe in any region.
-UPDATE buildings SET geom_m    = ST_CollectionExtract(ST_MakeValid(geom_m), 3)    WHERE NOT ST_IsValid(geom_m);
+-- geom_m is additionally snapped to the fixed-precision grid (grid_size) so every
+-- downstream overlay is grid-vs-grid — near-coincident edges cancel exactly
+-- instead of producing hairline slivers. Vertices move <= ~7 mm; the WEWCC
+-- passage-count FATAL in 99_selfcheck guards the detection predicates against
+-- that shift. geom_4326 stays RAW degrees (metric grid must never touch it; the
+-- full-fidelity export uses it untouched) and is only repaired when invalid.
+UPDATE buildings SET geom_m = ST_CollectionExtract(
+  ST_ReducePrecision(ST_MakeValid(geom_m, 'method=structure keepcollapsed=false'),
+                     (SELECT value FROM config WHERE key='grid_size')), 3);
 UPDATE buildings SET geom_4326 = ST_CollectionExtract(ST_MakeValid(geom_4326), 3) WHERE NOT ST_IsValid(geom_4326);
 
 ALTER TABLE buildings ADD PRIMARY KEY (id);

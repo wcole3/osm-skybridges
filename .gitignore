@@ -2,6 +2,7 @@
 /data/
 /web/data/
 /qa/*.geojson
+/exports/
 
 # local region selection (copy from region.example.mk)
 /region.mk
@@ -9,6 +10,7 @@
 # editor / os
 .DS_Store
 *.swp
+__pycache__/
 .vscode/dostuff/
 
 # workspace
