@@ -294,7 +294,10 @@ class Handler(SimpleHTTPRequestHandler):
         super().__init__(*a, directory=WEB, **kw)
 
     def log_message(self, fmt, *args):  # quieter: only API + errors
-        if '/api/' in (args[0] if args else ''):
+        # http.server may pass non-string args (for example HTTPStatus values
+        # from send_error); stringify before substring checks.
+        first = str(args[0]) if args else ''
+        if '/api/' in first:
             sys.stderr.write('[tuner] %s\n' % (fmt % args))
 
     def _json(self, obj, code=200):
